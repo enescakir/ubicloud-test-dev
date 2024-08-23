@@ -1,0 +1,45 @@
+name: Test Image
+
+on:
+  push:
+    branches: [ test-cache-run-id ]
+
+jobs:
+  test:
+    name: ${{matrix.runs-on}}
+    # container:
+    #   image: alpine:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # runs-on: [ubuntu-latest, ubicloud-standard-2-ubuntu-2004, ubicloud-standard-2-ubuntu-2204, ubicloud-standard-2-ubuntu-2404]
+        runs-on: [ubicloud-standard-2-ubuntu-2204]
+    runs-on: ${{matrix.runs-on}}
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: uname -mr
+        run: uname -mr
+
+      - name: printenv
+        run: printenv
+
+      - name: ls -lah /home/runner/actions-runner
+        continue-on-error: true
+        run: ls -lah /home/runner/actions-runner
+
+      - name: ls -lah /etc
+        continue-on-error: true
+        run: ls -lah /etc
+
+      - name: cat /etc/.github_context
+        continue-on-error: true
+        run: cat /etc/.github_context
+
+      - name: cat /home/runner/actions-runner/start-hook.sh
+        continue-on-error: true
+        run: cat /home/runner/actions-runner/start-hook.sh
+
+      - run: sleep 100000
