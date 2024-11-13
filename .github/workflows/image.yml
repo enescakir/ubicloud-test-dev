@@ -23,39 +23,40 @@ jobs:
       - name: ip a
         run: ip a
 
-      - name: IPv6 address
+      - name: Get IPv6 address
         run: curl -sL --ipv6 ifconfig.me
 
-      - name: check limit general
+      - name: Check DockerHub limit without explicit IP stack
         run: |
           TOKEN=$(curl "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull" | jq -r .token)
           curl --head -H "Authorization: Bearer $TOKEN" https://registry-1.docker.io/v2/ratelimitpreview/test/manifests/latest
 
-      - name: check limit IPv6
+      - name: Check DockerHub limit with IPv6
         continue-on-error: true
         run: |
           TOKEN=$(curl "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull" | jq -r .token)
           curl --ipv6 --head -H "Authorization: Bearer $TOKEN" https://registry-1.docker.io/v2/ratelimitpreview/test/manifests/latest
 
-      - name: check limit IPv4
+      - name: Check DockerHub limit with IPv4
         run: |
           TOKEN=$(curl "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull" | jq -r .token)
           curl --ipv4 --head -H "Authorization: Bearer $TOKEN" https://registry-1.docker.io/v2/ratelimitpreview/test/manifests/latest
 
-      - run: docker pull postgres:15.4
+      - name: Pull a docker image
+        run: docker pull postgres:15.4
 
-      - name: check limit general
+      - name: Check DockerHub limit without explicit IP stack
         run: |
           TOKEN=$(curl "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull" | jq -r .token)
           curl --head -H "Authorization: Bearer $TOKEN" https://registry-1.docker.io/v2/ratelimitpreview/test/manifests/latest
 
-      - name: check limit IPv6
+      - name: Check DockerHub limit with IPv6
         continue-on-error: true
         run: |
           TOKEN=$(curl "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull" | jq -r .token)
           curl --ipv6 --head -H "Authorization: Bearer $TOKEN" https://registry-1.docker.io/v2/ratelimitpreview/test/manifests/latest
 
-      - name: check limit IPv4
+      - name: Check DockerHub limit with IPv4
         run: |
           TOKEN=$(curl "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull" | jq -r .token)
           curl --ipv4 --head -H "Authorization: Bearer $TOKEN" https://registry-1.docker.io/v2/ratelimitpreview/test/manifests/latest
