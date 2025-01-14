@@ -2,7 +2,7 @@ name: Test Ubicloud Prod Runners
 
 on:
   push:
-    branches: [test-cache-all]
+    branches: [test-cache-v2]
   # schedule:
   #   - cron: '0 * * * *'
   
@@ -16,8 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         runs-on: [
-          ubicloud-standard-2-ubuntu-2004, ubicloud-standard-2-ubuntu-2204, ubicloud-standard-2-ubuntu-2404, 
-          ubicloud-standard-2-arm-ubuntu-2004, ubicloud-standard-2-arm-ubuntu-2204, ubicloud-standard-2-arm-ubuntu-2404
+          ubicloud-standard-2-ubuntu-2204
         ]
     runs-on: ${{ matrix.runs-on }}
     name: ${{ matrix.runs-on }}
