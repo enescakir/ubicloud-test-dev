@@ -2,7 +2,7 @@ name: Test Ubicloud Prod Runners
 
 on:
   push:
-    branches: [test-cache-v2]
+    branches: [main]
   # schedule:
   #   - cron: '0 * * * *'
   
