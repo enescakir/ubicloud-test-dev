@@ -101,7 +101,7 @@ jobs:
           path: |
             myfolder
             myfolder2
-          key: cached_folders-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runs-on }}
+          key: cached_folders
 
       # - name: Set up Docker Buildx
       #   uses: docker/setup-buildx-action@v3
@@ -229,7 +229,7 @@ jobs:
           path: |
             myfolder
             myfolder2
-          key: cached_folders-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runs-on }}
+          key: cached_folders
 
   #     - name: Error if cache doesn't hit for restore-file
   #       if: steps.restore-file.outputs.cache-hit == 'false'
