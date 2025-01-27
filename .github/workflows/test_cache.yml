@@ -96,7 +96,7 @@ jobs:
           dd if=/dev/urandom of=myfolder2/file1.txt bs=1M count=15
 
       - name: Save folders and files
-        uses: actions/cache/save@main
+        uses: enescakir/cache/save@more-sdk-logs
         with:
           path: |
             myfolder
