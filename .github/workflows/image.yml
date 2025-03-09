@@ -10,10 +10,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runs-on: [ubuntu-latest, ubicloud-standard-2-arm-ubuntu-2004, ubicloud-standard-2-arm-ubuntu-2204, ubicloud-standard-2-arm-ubuntu-2404]
+        runs-on: [ubuntu-latest, ubicloud-standard-2-ubuntu-2004, ubicloud-standard-2-ubuntu-2204, ubicloud-standard-2-ubuntu-2404]
         # runs-on: [ubicloud-standard-2-ubuntu-2204, ubicloud]
     runs-on: ${{matrix.runs-on}}
-
+    env:
+      CACHE_VERSION: ${{ matrix.runs-on }}-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: checkout
         uses: actions/checkout@v4
@@ -31,7 +32,7 @@ jobs:
           path: |
             myfolder
             myfolder2
-          key: cached_folders-2
+          key: cached_folders_${{ env.CACHE_VERSION }}
 
       - name: Save folders and files
         uses: actions/cache/save@v4
@@ -39,8 +40,20 @@ jobs:
           path: |
             myfolder
             myfolder2
-          key: cached_folders-2
+          key: cached_folders_${{ env.CACHE_VERSION }}
   
+      - run: |
+          rm -rf myfolder
+          rm -rf myfolder2
+
+      - name: Restore folders and files
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            myfolder
+            myfolder2
+          key: cached_folders_${{ env.CACHE_VERSION }}
+
       - name: Setup Ruby with cache
         id: setup-ruby
         uses: ruby/setup-ruby@v1
@@ -49,3 +62,4 @@ jobs:
         with:
           ruby-version: '3.2.6'
           bundler-cache: true
+          cache-version: ${{ env.CACHE_VERSION }}
