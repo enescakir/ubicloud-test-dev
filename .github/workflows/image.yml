@@ -2,7 +2,7 @@ name: Test Image
 
 on:
   push:
-    branches: [ main ]
+    branches: [ check-azure-cli ]
 
 jobs:
   test:
@@ -10,165 +10,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runs-on: [ubuntu-latest, ubicloud-standard-2-arm-ubuntu-2004, ubicloud-standard-2-arm-ubuntu-2204, ubicloud-standard-2-arm-ubuntu-2404]
+        runs-on: [ubicloud-standard-2-ubuntu-2204, ubicloud-standard-2-ubuntu-2404]
         # runs-on: [ubicloud-standard-2-ubuntu-2204]
     runs-on: ${{matrix.runs-on}}
 
     steps:
-      - name: checkout
-        uses: actions/checkout@v4
-
-      - name: uname -mr
-        run: uname -mr
-
-      - run: cat /home/runner/actions-runner/start-hook.sh
-      
-      - run: cat /usr/include/stdc-predef.h
-
-      - name: lsb_release -a
-        run: lsb_release -a
-
-      - name: printenv
-        run: printenv
-
-      - name: echo $PATH
-        run: echo $PATH
-
-      - name: Dump context
-        uses: crazy-max/ghaction-dump-context@v2
-  
-      - name: cat /home/runner/actions-runner/.env
-        continue-on-error: true
-        run: cat /home/runner/actions-runner/.env
-
-      - name: cat /home/runner/actions-runner/run-withenv.sh
-        continue-on-error: true
-        run: cat /home/runner/actions-runner/run-withenv.sh
-
-      - name: Try to update apt-get
-        run: sudo apt-get update
-
-      - name: Check filesystem
-        run: sudo fsck -nf || [ $? -eq 4 ]
-
-
-      - name: sudo apt-get install wireshark
-        run: sudo apt-get install wireshark
-
-      - name: df -Th
-        run: df -Th
-
-      - name: cat /etc/.github_context
-        continue-on-error: true
-        run: cat /etc/.github_context
-
-      - name: cat /home/runner/actions-runner/start-hook.sh
-        continue-on-error: true
-        run: cat /home/runner/actions-runner/start-hook.sh
-
-      - uses: actions/setup-python@v2
-        continue-on-error: true
-        with:
-          python-version: '3.x'
-
-      - name: python -c "print('Hello, World!')"
-        run: python -c "print('Hello, World!')"
-
-      - name: pip install requests
-        continue-on-error: true
-        run: pip install requests
-
-      - uses: actions/setup-node@v2
-        continue-on-error: true
-        with:
-          node-version: '14'
-
-      - name: npx playwright install --with-deps chromium
-        continue-on-error: true
-        run: npx playwright install --with-deps chromium
-
-      - name: sudo npm i -g npm
-        continue-on-error: true
-        run: sudo npm i -g npm
-
-      - uses: ruby/setup-ruby@v1
-        continue-on-error: true
-        with:
-          ruby-version: '3.2.5'
-
-      - name: sudo gem install drip
-        continue-on-error: true
-        run: sudo gem install drip
-
-      - name: ruby -e 'puts "Hello, world."'
-        continue-on-error: true
-        run: ruby -e 'puts "Hello, world."'
-
-      - name: docker pull ubicloud/ubicloud
-        run: docker pull ubicloud/ubicloud
-
-      - name: sudo apt list --installed | grep libpq
-        run: sudo apt list --installed | grep libpq
-
-      - name: cargo
-        continue-on-error: true
-        run: |
-          git clone https://github.com/sharkdp/fd
-
-          # Build
-          cd fd
-          cargo build
-
-          # Run unit tests and integration tests
-          cargo test
-
-          # Install
-          cargo install --path .
-
-      - name: sudo -l
-        run: sudo -l
-
-      - name: sudo ls -lah /etc/sudoers.d
-        run: sudo ls -lah /etc/sudoers.d
-
-      - name: docker run -d -v "$(pwd)":/workspace --name alpine alpine tail -f /dev/null
-        run: docker run -d -v "$(pwd)":/workspace --name alpine alpine tail -f /dev/null
-
-      - name: docker exec alpine ls -lah
-        run: docker exec alpine ls -lah
-
-      - name: docker exec alpine ls -lah /workspace
-        run: docker exec alpine ls -lah /workspace
-
-      - name: docker exec alpine touch /workspace/test.txt
-        run: docker exec alpine touch /workspace/test.txt
-
-      - name: docker exec alpine ls -lah /workspace
-        run: docker exec alpine ls -lah /workspace
-
-      - name: cat /etc/passwd
-        run: cat /etc/passwd
-
-      - name: loginctl show-user 1001 --property=Linger
-        run: loginctl show-user 1001 --property=Linger
-
-      - name: cat /etc/group
-        run: cat /etc/group
-
-      - name: groups runner
-        run: groups runner
-
-      - name: cat /proc/meminfo
-        run: cat /proc/meminfo
-
-      - name: swapon -s
-        run: swapon -s
-
-      - name: free -h
-        run: free -h
-
-      - name: swapon --all --verbose
-        run: swapon --all --verbose
-
-      - name: cat /proc/swaps
-        run: cat /proc/swaps
+      - run: az version
+      - run: az upgrade --yes
+      - run: az version
+      - run: ls -lah /opt/az/bin
+      - run: /opt/az/bin/python3 --version
+      - run: ls -lah /opt/az/lib/python3.12/site-packages/pip/_vendor/rich/__pycache__/_emoji_codes.cpython-312.pyc
+      - run: az version
+      - run: az extension add --name account --debug
