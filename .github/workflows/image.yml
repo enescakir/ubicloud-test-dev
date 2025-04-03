@@ -2,7 +2,7 @@ name: Test Image
 
 on:
   push:
-    branches: [ test-cache ]
+    branches: [ dependabot/bundler/production-dependencies-f1a65b3f1e ]
 
 jobs:
   test:
