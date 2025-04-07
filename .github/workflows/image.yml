@@ -17,8 +17,8 @@ jobs:
           - ubicloud-standard-4-ubuntu-2204
           - ubicloud-standard-2-ubuntu-2404
           # - ubicloud-standard-2-arm-ubuntu-2004
-          - ubicloud-standard-2-arm-ubuntu-2204
-          - ubicloud-standard-2-arm-ubuntu-2404
+          # - ubicloud-standard-2-arm-ubuntu-2204
+          # - ubicloud-standard-2-arm-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: ubicloud/ssh-runner@v1
