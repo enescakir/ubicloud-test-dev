@@ -9,22 +9,21 @@ jobs:
     name: ${{matrix.runs-on}}
     runs-on: ${{matrix.runs-on}}
     strategy:
-      max-parallel: 2
       fail-fast: false
       matrix:
         runs-on:
-          # - ubicloud-standard-2-ubuntu-2004
+          - ubicloud-standard-2-ubuntu-2004
           - ubicloud-standard-2-ubuntu-2204
-          # - ubicloud-standard-2-ubuntu-2404
-          # - ubicloud-standard-2-arm-ubuntu-2004
-          # - ubicloud-standard-2-arm-ubuntu-2204
-          # - ubicloud-standard-2-arm-ubuntu-2404
+          - ubicloud-standard-2-ubuntu-2404
+          - ubicloud-standard-2-arm-ubuntu-2004
+          - ubicloud-standard-2-arm-ubuntu-2204
+          - ubicloud-standard-2-arm-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: ubicloud/ssh-runner@v1
         with:
           public-ssh-key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMsY2oTeeKCK8pr339MREPlai6bvnlnCX3pvCCBKoJ7c enes@cakir.web.tr"
-          wait-minutes: 120
+          wait-minutes: 0
       # Metadata checks
       - run: uname -mr
       - run: lsb_release -a
@@ -57,7 +56,13 @@ jobs:
           make
       - run: sudo gdisk -l /dev/vda
       - if: ${{ !contains(matrix.runs-on, 'ubuntu-2004') }}
-        run: sudo ./fstools/blk2files -b /dev/vda1 -p / -s 157284000 -e 157286366
+        run: |
+          if [[ "$(arch)" == "aarch64" ]]; then
+            echo "Running on ARM architecture"
+            sudo ./fstools/blk2files -b /dev/vda1 -p / -s 104857600 -e 104857566
+          else
+            sudo ./fstools/blk2files -b /dev/vda1 -p / -s 157286400 -e 157286366
+          fi
 
       # Previously encountered issues
       - run: cat /usr/include/stdc-predef.h
