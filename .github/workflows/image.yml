@@ -24,7 +24,7 @@ jobs:
       - uses: ubicloud/ssh-runner@v1
         with:
           public-ssh-key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMsY2oTeeKCK8pr339MREPlai6bvnlnCX3pvCCBKoJ7c enes@cakir.web.tr"
-          wait-minutes: 120
+          wait-minutes: 0
       # Metadata checks
       - run: uname -mr
       - run: lsb_release -a
@@ -47,8 +47,17 @@ jobs:
       - run: sudo apt-get update
       - run: sudo apt-get install wireshark
 
-      - name: Check filesystem
-        run: sudo fsck -nf || [ $? -eq 4 ]
+      # File corruption checks
+      - run: sudo fsck -nf || [ $? -eq 4 ]
+      - name: install fstools
+        if: ${{ !contains(matrix.runs-on, 'ubuntu-2004') }}
+        run: |
+          sudo apt install build-essential libext2fs-dev
+          cd fstools
+          make
+      - run: sudo gdisk -l /dev/vda
+      - if: ${{ !contains(matrix.runs-on, 'ubuntu-2004') }}
+        run: sudo ./fstools/blk2files -b /dev/vda1 -p / -s 157284000 -e 157286366
 
       # Previously encountered issues
       - run: cat /usr/include/stdc-predef.h
@@ -60,6 +69,7 @@ jobs:
           az extension add --name account --debug
 
       # Docker checks
+      - run: cat /etc/docker/daemon.json | jq
       - run: docker info
       - run: docker pull ubicloud/ubicloud
       - run: docker run -d -v "$(pwd)":/workspace --name alpine alpine tail -f /dev/null
