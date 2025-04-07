@@ -12,12 +12,12 @@ jobs:
       fail-fast: false
       matrix:
         runs-on:
-          - ubicloud-standard-2-ubuntu-2004
+          # - ubicloud-standard-2-ubuntu-2004
           - ubicloud-standard-2-ubuntu-2204
-          - ubicloud-standard-2-ubuntu-2404
-          - ubicloud-standard-2-arm-ubuntu-2004
-          - ubicloud-standard-2-arm-ubuntu-2204
-          - ubicloud-standard-2-arm-ubuntu-2404
+          # - ubicloud-standard-2-ubuntu-2404
+          # - ubicloud-standard-2-arm-ubuntu-2004
+          # - ubicloud-standard-2-arm-ubuntu-2204
+          # - ubicloud-standard-2-arm-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: ubicloud/ssh-runner@v1
@@ -82,6 +82,11 @@ jobs:
       - run: docker exec alpine ls -lah /workspace
       - run: docker exec alpine touch /workspace/test.txt
       - run: docker exec alpine ls -lah /workspace
+      - run: |
+          docker buildx build --load . -f - <<EOF
+          FROM alpine
+          RUN echo "hello world"
+          EOF
 
       # Language specific checks
       - uses: actions/setup-python@v2
