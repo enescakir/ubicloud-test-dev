@@ -12,10 +12,9 @@ jobs:
       fail-fast: false
       matrix:
         runs-on:
-          # - ubicloud-standard-2-ubuntu-2004
           - ubicloud-standard-2-ubuntu-2204
           # - ubicloud-standard-2-ubuntu-2404
-          # - ubicloud-standard-2-arm-ubuntu-2004
+          # - ubicloud-standard-2-ubuntu-2404
           # - ubicloud-standard-2-arm-ubuntu-2204
           # - ubicloud-standard-2-arm-ubuntu-2404
     steps:
@@ -39,8 +38,10 @@ jobs:
       # Ubicloud file checks
       - run: cat /home/runner/actions-runner/start-hook.sh
       - run: cat /home/runner/actions-runner/.env
+      - run: ls -lah /home/runner/actions-runner/run-withenv.sh
       - run: cat /home/runner/actions-runner/run-withenv.sh
       - run: cat /etc/.github_context
+      - run: sudo ls -lah /etc/systemd/system/runner-script.service
 
       # General image checks
       - run: sudo apt-get update
@@ -75,7 +76,9 @@ jobs:
 
       # Docker checks
       - run: cat /etc/docker/daemon.json | jq
+      - run: cat /etc/buildkit/buildkitd.toml
       - run: docker info
+      - run: docker buildx inspect
       - run: docker pull ubicloud/ubicloud
       - run: docker run -d -v "$(pwd)":/workspace --name alpine alpine tail -f /dev/null
       - run: docker exec alpine ls -lah
@@ -87,6 +90,9 @@ jobs:
           FROM alpine
           RUN echo "hello world"
           EOF
+      - run: |
+          TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull" | jq -r .token)
+          curl -s --head -H "Authorization: Bearer $TOKEN" https://registry-1.docker.io/v2/ratelimitpreview/test/manifests/latest | grep ratelimit
 
       # Language specific checks
       - uses: actions/setup-python@v2
