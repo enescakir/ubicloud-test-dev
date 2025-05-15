@@ -15,6 +15,16 @@ jobs:
           - ubicloud-standard-2-ubuntu-2204
           - ubicloud-standard-2-ubuntu-2204
           - ubicloud-standard-2-ubuntu-2204
+          - ubicloud-standard-2-ubuntu-2204
+          - ubicloud-standard-2-ubuntu-2204
+          - ubicloud-standard-2-ubuntu-2204
+          - ubicloud-standard-2-ubuntu-2204
+          - ubicloud-standard-2-ubuntu-2204
+          - ubicloud-standard-2-ubuntu-2204
+          - ubicloud-standard-2-ubuntu-2204
+          - ubicloud-standard-2-ubuntu-2204
+          - ubicloud-standard-2-ubuntu-2204
+
     steps:
       - uses: actions/checkout@v4
       - uses: ubicloud/ssh-runner@v1
@@ -34,5 +44,5 @@ jobs:
       - run: swapon -s
       - run: cat /proc/swaps
       - run: ls -lah /home/runner/actions-runner/
-      - run: cat /home/runner/actions-runner/.ubicloud_complete_message
+      - run: cat /home/runner/actions-runner/start-hook.sh
       - run: cat /home/runner/actions-runner/complete-hook.sh
