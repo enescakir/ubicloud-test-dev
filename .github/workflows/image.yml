@@ -22,10 +22,11 @@ jobs:
       - uses: ubicloud/ssh-runner@v1
         with:
           public-ssh-key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMsY2oTeeKCK8pr339MREPlai6bvnlnCX3pvCCBKoJ7c enes@cakir.web.tr"
-          wait-minutes: 0
+          wait-minutes: 120
       # Metadata checks
-      - run: printenv
-      - run: groups runneradmin
-      - run: cat /etc/environment
-      - run: ls -lah /home/runner/actions-runner/
-      - run: cat /home/runner/actions-runner/.ubicloud_info
+      - run: systemd-analyze
+      - run: systemd-analyze blame
+      - run: systemd-analyze critical-chain network-online.target
+      - run: systemd-analyze critical-chain sshd.service
+      - run: cloud-init analyze blame
+      - run: cloud-init analyze show 
