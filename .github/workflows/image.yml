@@ -32,6 +32,8 @@ jobs:
       - run: sudo ls -lah /home/ubuntu
       - run: sudo ls -lah /home/runneradmin
       - run: sudo ls -lah /home/runner
+      - run: echo $PATH
+      - run: printenv
 
       - name: Generate folders and files to cache
         run: |
