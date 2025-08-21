@@ -11,10 +11,8 @@ jobs:
       fail-fast: false
       matrix:
         runs-on:
-          # - ubicloud-standard-2-ubuntu-2004
           - ubicloud-standard-2-ubuntu-2204
           # - ubicloud-standard-2-ubuntu-2404
-          # - ubicloud-standard-2-arm-ubuntu-2004
           # - ubicloud-standard-2-arm-ubuntu-2204
           # - ubicloud-standard-2-arm-ubuntu-2404
         # runs-on: [ubicloud-standard-2-ubuntu-2204, ubicloud]
@@ -30,6 +28,7 @@ jobs:
       - run: sudo cat /etc/passwd
       - run: sudo ls -lah /home
       - run: sudo ls -lah /home/ubuntu
+        continue-on-error: true
       - run: sudo ls -lah /home/runneradmin
       - run: sudo ls -lah /home/runner
       - run: echo $PATH
