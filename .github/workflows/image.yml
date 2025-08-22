@@ -13,10 +13,9 @@ jobs:
       matrix:
         runs-on:
           - ubicloud-standard-2-ubuntu-2204
-          # - ubicloud-standard-2-ubuntu-2404
-          # - ubicloud-standard-2-ubuntu-2404
-          # - ubicloud-standard-2-arm-ubuntu-2204
-          # - ubicloud-standard-2-arm-ubuntu-2404
+          - ubicloud-standard-2-ubuntu-2404
+          - ubicloud-standard-2-arm-ubuntu-2204
+          - ubicloud-standard-2-arm-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: ubicloud/ssh-runner@v1
@@ -64,6 +63,14 @@ jobs:
           else
             sudo ./fstools/blk2files -b /dev/vda1 -p / -s 157286400 -e 157286366
           fi
+
+      # Booting specific checks
+      - run: systemd-analyze
+      - run: systemd-analyze blame
+      - run: systemd-analyze critical-chain network-online.target
+      - run: systemd-analyze critical-chain sshd.service
+      - run: cloud-init analyze blame
+      - run: cloud-init analyze show 
 
       # Previously encountered issues
       - run: cat /usr/include/stdc-predef.h
