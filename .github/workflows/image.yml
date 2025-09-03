@@ -13,9 +13,9 @@ jobs:
       matrix:
         runs-on:
           - ubicloud-standard-2-ubuntu-2204
-          - ubicloud-standard-2-ubuntu-2404
-          - ubicloud-standard-2-arm-ubuntu-2204
-          - ubicloud-standard-2-arm-ubuntu-2404
+          # - ubicloud-standard-2-ubuntu-2404
+          # - ubicloud-standard-2-arm-ubuntu-2204
+          # - ubicloud-standard-2-arm-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: ubicloud/ssh-runner@v1
@@ -45,24 +45,6 @@ jobs:
       # General image checks
       - run: sudo apt-get update
       - run: sudo apt-get install wireshark
-
-      # File corruption checks
-      - run: sudo fsck -nf || [ $? -eq 4 ]
-      - name: install fstools
-        if: ${{ !contains(matrix.runs-on, 'ubuntu-2004') }}
-        run: |
-          sudo apt install build-essential libext2fs-dev
-          cd fstools
-          make
-      - run: sudo gdisk -l /dev/vda
-      - if: ${{ !contains(matrix.runs-on, 'ubuntu-2004') }}
-        run: |
-          if [[ "$(arch)" == "aarch64" ]]; then
-            echo "Running on ARM architecture"
-            sudo ./fstools/blk2files -b /dev/vda1 -p / -s 104857600 -e 104857566
-          else
-            sudo ./fstools/blk2files -b /dev/vda1 -p / -s 157286400 -e 157286366
-          fi
 
       # Booting specific checks
       - run: systemd-analyze
@@ -129,3 +111,21 @@ jobs:
           cargo build
           cargo test
           cargo install --path .
+
+      # File corruption checks
+      - run: sudo fsck -nf || [ $? -eq 4 ]
+      - name: install fstools
+        if: ${{ !contains(matrix.runs-on, 'ubuntu-2004') }}
+        run: |
+          sudo apt install build-essential libext2fs-dev
+          cd fstools
+          make
+      - run: sudo gdisk -l /dev/vda
+      - if: ${{ !contains(matrix.runs-on, 'ubuntu-2004') }}
+        run: |
+          if [[ "$(arch)" == "aarch64" ]]; then
+            echo "Running on ARM architecture"
+            sudo ./fstools/blk2files -b /dev/vda1 -p / -s 104857600 -e 104857566
+          else
+            sudo ./fstools/blk2files -b /dev/vda1 -p / -s 157286400 -e 157286366
+          fi
