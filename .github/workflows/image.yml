@@ -14,8 +14,8 @@ jobs:
         runs-on:
           - ubicloud
           - ubicloud-standard-2
-          - ubicloud-standard-2-ubuntu-2204
-          - ubicloud-standard-2-ubuntu-2404
+          - test
+          - bnr
     steps:
       - uses: actions/checkout@v4
       - uses: ubicloud/ssh-runner@v1
