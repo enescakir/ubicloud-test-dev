@@ -12,8 +12,6 @@ jobs:
       fail-fast: false
       matrix:
         runs-on:
-          - ubicloud
-          - ubicloud-standard-2
           - ubicloud-standard-2-ubuntu-2204
           - ubicloud-standard-2-ubuntu-2404
     steps:
@@ -32,7 +30,7 @@ jobs:
       - run: cat /proc/meminfo
       - run: swapon -s
       - run: cat /proc/swaps
-      # - uses: crazy-max/ghaction-dump-context@v2
+      - uses: crazy-max/ghaction-dump-context@v2
 
       # # Ubicloud file checks
       # - run: cat /home/runner/actions-runner/start-hook.sh
@@ -43,8 +41,8 @@ jobs:
       # - run: sudo ls -lah /etc/systemd/system/runner-script.service
 
       # # General image checks
-      # - run: sudo apt-get update
-      # - run: sudo apt-get install wireshark
+      - run: sudo apt-get update
+      - run: sudo apt-get install wireshark
 
       # # Booting specific checks
       # - run: systemd-analyze
