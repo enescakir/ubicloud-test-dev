@@ -11,6 +11,7 @@ jobs:
       fail-fast: false
       matrix:
         runs-on:
+          # - ubuntu-latest
           # - ubicloud-standard-2-ubuntu-2204
           # - ubicloud-standard-2-ubuntu-2404
           - ubicloud-standard-2-arm-ubuntu-2204
@@ -30,7 +31,9 @@ jobs:
       - run: sudo ls -lah /home/ubuntu
         continue-on-error: true
       - run: sudo ls -lah /home/runneradmin
+        continue-on-error: true
       - run: sudo ls -lah /home/runner
+        continue-on-error: true
       - run: echo $PATH
       - run: printenv
 
@@ -78,3 +81,9 @@ jobs:
           ruby-version: '3.2.6'
           bundler-cache: true
           cache-version: ${{ env.CACHE_VERSION }}
+
+      - run: npm --version
+      - run: node --version
+      - run: which node
+      - run: which npm
+      - run: ls -lah /opt/hostedtoolcache/node
