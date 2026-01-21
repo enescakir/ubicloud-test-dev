@@ -13,7 +13,7 @@ jobs:
       matrix:
         runs-on:
           - ubicloud-standard-2-ubuntu-2204
-          # - ubicloud-standard-2-ubuntu-2404
+          - ubicloud-standard-2-ubuntu-2404
           # - ubicloud-standard-2-arm-ubuntu-2204
           # - ubicloud-standard-2-arm-ubuntu-2404
     steps:
