@@ -2,133 +2,34 @@ name: Test ubicloud image
 
 on:
   push:
-    branches: [ main ]
+    branches: [ test-big-cache ]
 
 jobs:
-  test:
-    name: ${{matrix.runs-on}}
-    runs-on: ${{matrix.runs-on}}
-    strategy:
-      fail-fast: false
-      matrix:
-        runs-on:
-          - ubicloud-standard-2-ubuntu-2204
-          - ubicloud-standard-2-ubuntu-2404
-          - ubuntu-latest
-          - ubuntu-22.04
-          - ubuntu-24.04
-          # - ubicloud-standard-2-arm-ubuntu-2204
-          # - ubicloud-standard-2-arm-ubuntu-2404
+  save:
+    runs-on: ubicloud
     steps:
-      - uses: actions/checkout@v4
-      - uses: ubicloud/ssh-runner@v1
+      - name: download hetzner test file
+        run: wget https://fsn1-speed.hetzner.com/100MB.bin -O 100MB.bin
+      - uses: actions/cache/save@v5
         with:
-          public-ssh-key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMsY2oTeeKCK8pr339MREPlai6bvnlnCX3pvCCBKoJ7c enes@cakir.web.tr"
-          wait-minutes: 0
-      # Metadata checks
-      - run: uname -mr
-      - run: lsb_release -a
-      - run: echo $PATH
-      - run: printenv
-      - run: df -Th
-      - run: free -h
-      - run: cat /proc/meminfo
-      - run: swapon -s
-      - run: cat /proc/swaps
-      - uses: crazy-max/ghaction-dump-context@v2
+          path: 100MB.bin
+          key: cache-${{ github.run_id }}
+      - name: Print cache proxy logs
+        if: always()
+        run: sudo cat /var/log/cacheproxy.log
 
-      # Ubicloud file checks
-      - run: cat /home/runner/actions-runner/start-hook.sh
-      - run: cat /home/runner/actions-runner/.env
-      - run: ls -lah /home/runner/actions-runner/run-withenv.sh
-      - run: cat /home/runner/actions-runner/run-withenv.sh
-      - run: cat /etc/.github_context
-      - run: sudo ls -lah /etc/systemd/system/runner-script.service
-
-      # General image checks
-      - run: sudo apt-get update
-      - run: sudo apt-get install wireshark
-
-      # Booting specific checks
-      - run: systemd-analyze
-      - run: systemd-analyze blame
-      - run: systemd-analyze critical-chain network-online.target
-      - run: systemd-analyze critical-chain sshd.service
-      - run: cloud-init analyze blame
-      - run: cloud-init analyze show 
-
-      # Previously encountered issues
-      - run: cat /usr/include/stdc-predef.h
-      - run: sudo apt list --installed | grep libpq
-      - run: |
-          az version
-          az upgrade --yes
-          az version
-          az extension add --name account --debug
-
-      # Docker checks
-      - run: cat /etc/docker/daemon.json | jq
-      - run: cat /etc/buildkit/buildkitd.toml
-      - run: docker info
-      - run: docker buildx inspect
-      - run: docker pull ubicloud/ubicloud
-      - run: docker run -d -v "$(pwd)":/workspace --name alpine alpine tail -f /dev/null
-      - run: docker exec alpine ls -lah
-      - run: docker exec alpine ls -lah /workspace
-      - run: docker exec alpine touch /workspace/test.txt
-      - run: docker exec alpine ls -lah /workspace
-      - run: |
-          docker buildx build --load . -f - <<EOF
-          FROM alpine
-          RUN echo "hello world"
-          EOF
-      - run: |
-          TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull" | jq -r .token)
-          curl -s --head -H "Authorization: Bearer $TOKEN" https://registry-1.docker.io/v2/ratelimitpreview/test/manifests/latest | grep ratelimit
-
-      # Language specific checks
-      - uses: actions/setup-python@v2
-        if: ${{ !contains(matrix.runs-on, 'arm-ubuntu-2004') }}
+  restore:
+    needs: save
+    strategy:
+      matrix:
+        index: [1, 2, 3, 4, 5]
+    runs-on: ubicloud
+    name: restore ${{ matrix.index }}
+    steps:
+      - uses: actions/cache/restore@v5
         with:
-          python-version: '3.x'
-      - run: python -c "print('Hello, World!')"
-      - run: pip install requests
-
-      - uses: actions/setup-node@v2
-        with:
-          node-version: '22'
-      - run: npx playwright install --with-deps chromium
-      - run: sudo npm i -g npm
-
-      - uses: ruby/setup-ruby@v1
-        if: ${{ !contains(matrix.runs-on, 'arm-ubuntu-2004') }}
-        with:
-          ruby-version: '3.2.5'
-      - run: sudo gem install drip
-      - run: ruby -e 'puts "Hello, world."'
-    
-      - name: rust cargo
-        run: |
-          git clone https://github.com/sharkdp/fd
-          cd fd
-          cargo build
-          cargo test
-          cargo install --path .
-
-      # File corruption checks
-      - run: sudo fsck -nf || [ $? -eq 4 ]
-      - name: install fstools
-        if: ${{ !contains(matrix.runs-on, 'ubuntu-2004') }}
-        run: |
-          sudo apt install build-essential libext2fs-dev
-          cd fstools
-          make
-      - run: sudo gdisk -l /dev/vda
-      - if: ${{ !contains(matrix.runs-on, 'ubuntu-2004') }}
-        run: |
-          if [[ "$(arch)" == "aarch64" ]]; then
-            echo "Running on ARM architecture"
-            sudo ./fstools/blk2files -b /dev/vda1 -p / -s 104857600 -e 104857566
-          else
-            sudo ./fstools/blk2files -b /dev/vda1 -p / -s 157286400 -e 157286366
-          fi
+          path: 100MB.bin
+          key: cache-${{ github.run_id }}
+      - name: Print cache proxy logs
+        if: always()
+        run: sudo cat /var/log/cacheproxy.log
