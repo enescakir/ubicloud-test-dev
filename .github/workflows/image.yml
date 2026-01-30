@@ -4,16 +4,21 @@ on:
   push:
     branches: [ test-big-cache ]
 
+env:
+  FILENAME: 1GB.bin
+
 jobs:
   save:
-    runs-on: ubicloud
+    runs-on: ubicloud-standard-4
     steps:
       - name: download hetzner test file
-        run: wget https://fsn1-speed.hetzner.com/100MB.bin -O 100MB.bin
-      - uses: actions/cache/save@v5
+        run: |
+          sudo apt-get update && sudo apt-get install -y aria2
+          aria2c -x 10 "https://fsn1-speed.hetzner.com/${{ env.FILENAME }}"
+      - uses: ubicloud/cache/save@v4
         with:
-          path: 100MB.bin
-          key: cache-${{ github.run_id }}
+          path: ${{ env.FILENAME }}
+          key: cache-${{ env.FILENAME }}-${{ github.run_id }}
       - name: Print cache proxy logs
         if: always()
         run: sudo cat /var/log/cacheproxy.log
@@ -23,13 +28,13 @@ jobs:
     strategy:
       matrix:
         index: [1, 2, 3, 4, 5]
-    runs-on: ubicloud
+    runs-on: ubicloud-standard-4
     name: restore ${{ matrix.index }}
     steps:
-      - uses: actions/cache/restore@v5
+      - uses: ubicloud/cache/restore@v4
         with:
-          path: 100MB.bin
-          key: cache-${{ github.run_id }}
+          path: ${{ env.FILENAME }}
+          key: cache-${{ env.FILENAME }}-${{ github.run_id }}
       - name: Print cache proxy logs
         if: always()
         run: sudo cat /var/log/cacheproxy.log
