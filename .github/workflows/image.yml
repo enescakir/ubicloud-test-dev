@@ -12,11 +12,11 @@ jobs:
       fail-fast: false
       matrix:
         runs-on:
-          - ubicloud-standard-2-ubuntu-2204
-          - ubicloud-standard-2-ubuntu-2404
-          - ubuntu-latest
-          - ubuntu-22.04
-          - ubuntu-24.04
+          # - ubicloud-standard-2-ubuntu-2204
+          # - ubicloud-standard-2-ubuntu-2404
+          # - ubuntu-latest
+          # - ubuntu-22.04
+          # - ubuntu-24.04
           - ubicloud-standard-2-arm-ubuntu-2204
           - ubicloud-standard-2-arm-ubuntu-2404
     steps:
