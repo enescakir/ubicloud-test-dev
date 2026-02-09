@@ -2,7 +2,7 @@ name: Test ubicloud image
 
 on:
   push:
-    branches: [ main ]
+    branches: [ enes/test-persistent ]
 
 jobs:
   test:
@@ -12,17 +12,7 @@ jobs:
       fail-fast: false
       matrix:
         runs-on:
-          - ubicloud-standard-2-ubuntu-2204
-          - ubicloud-standard-2-ubuntu-2404
-          - ubicloud-standard-2-ubuntu-2204
-          - ubicloud-standard-2-ubuntu-2404
-          - ubicloud-standard-2-ubuntu-2204
-          - ubicloud-standard-2-ubuntu-2404
-          # - ubuntu-latest
-          # - ubuntu-22.04
-          # - ubuntu-24.04
-          - ubicloud-standard-2-arm-ubuntu-2204
-          - ubicloud-standard-2-arm-ubuntu-2404
+          - ubicloud-persistent
     steps:
       - uses: actions/checkout@v4
       - uses: ubicloud/ssh-runner@v1
@@ -39,7 +29,7 @@ jobs:
       - run: cat /proc/meminfo
       - run: swapon -s
       - run: cat /proc/swaps
-      # - uses: crazy-max/ghaction-dump-context@v2
+      - uses: crazy-max/ghaction-dump-context@v2
 
       # # Ubicloud file checks
       # - run: cat /home/runner/actions-runner/start-hook.sh
