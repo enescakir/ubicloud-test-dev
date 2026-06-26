@@ -19,9 +19,9 @@ jobs:
           - ubuntu-22.04
           - ubuntu-24.04
           - ubuntu-26.04
-          - ubicloud-standard-2-arm-ubuntu-2204
-          - ubicloud-standard-2-arm-ubuntu-2404
-          - ubicloud-standard-2-arm-ubuntu-2604
+          # - ubicloud-standard-2-arm-ubuntu-2204
+          # - ubicloud-standard-2-arm-ubuntu-2404
+          # - ubicloud-standard-2-arm-ubuntu-2604
     steps:
       - uses: actions/checkout@v6
       - uses: ubicloud/ssh-runner@v2
@@ -41,7 +41,7 @@ jobs:
       - run: sudo cat /etc/apt/apt-mirrors.txt
       - run: sudo dpkg -l kmod
       - run: sudo apt-get update
-      # - run: sudo apt-get install -y curl jq
+      - run: sudo apt-get install -y curl jq lshw lsscsi smartmontools hdparm
       # - uses: crazy-max/ghaction-dump-context@v2
 
       # # Ubicloud file checks
@@ -62,7 +62,7 @@ jobs:
       # - run: systemd-analyze critical-chain network-online.target
       # - run: systemd-analyze critical-chain sshd.service
       # - run: cloud-init analyze blame
-      # - run: cloud-init analyze show 
+      # - run: cloud-init analyze show
 
       # # Previously encountered issues
       # - run: cat /usr/include/stdc-predef.h
@@ -113,7 +113,7 @@ jobs:
       #     ruby-version: '3.2.5'
       # - run: sudo gem install drip
       # - run: ruby -e 'puts "Hello, world."'
-    
+
       # - name: rust cargo
       #   run: |
       #     git clone https://github.com/sharkdp/fd
