@@ -12,13 +12,13 @@ jobs:
       fail-fast: false
       matrix:
         runs-on:
-          - ubicloud-standard-2-ubuntu-2204
+          # - ubicloud-standard-2-ubuntu-2204
           - ubicloud-standard-2-ubuntu-2404
-          - ubicloud-standard-2-ubuntu-2604
+          # - ubicloud-standard-2-ubuntu-2604
           # - ubuntu-latest
-          - ubuntu-22.04
-          - ubuntu-24.04
-          - ubuntu-26.04
+          # - ubuntu-22.04
+          # - ubuntu-24.04
+          # - ubuntu-26.04
           # - ubicloud-standard-2-arm-ubuntu-2204
           # - ubicloud-standard-2-arm-ubuntu-2404
           # - ubicloud-standard-2-arm-ubuntu-2604
@@ -30,6 +30,9 @@ jobs:
           wait-minutes: 0
       # Metadata checks
       - run: uname -mr
+      - run: curl -4 ifconfig.me
+      - run: curl -6 ifconfig.me
+      - run: curl -4 ipinfo.io
       - run: lsb_release -a
       - run: echo $PATH
       - run: printenv
