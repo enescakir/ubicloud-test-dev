@@ -42,6 +42,7 @@ jobs:
       - run: sudo dpkg -l kmod
       - run: sudo apt-get update
       - run: sudo apt-get install -y curl jq lshw lsscsi smartmontools hdparm
+      - run: psql --version
       # - uses: crazy-max/ghaction-dump-context@v2
 
       # # Ubicloud file checks
