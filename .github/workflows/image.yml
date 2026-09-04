@@ -9,13 +9,13 @@ env:
 
 jobs:
   save:
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     steps:
       - name: download hetzner test file
         run: |
           sudo apt-get update && sudo apt-get install -y aria2
           aria2c -x 10 "https://fsn1-speed.hetzner.com/${{ env.FILENAME }}"
-      - uses: ubicloud/cache/save@v4
+      - uses: actions/cache/save@v6
         with:
           path: ${{ env.FILENAME }}
           key: cache-${{ env.FILENAME }}-${{ github.run_id }}
@@ -28,10 +28,10 @@ jobs:
     strategy:
       matrix:
         index: [1, 2, 3, 4, 5]
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     name: restore ${{ matrix.index }}
     steps:
-      - uses: ubicloud/cache/restore@v4
+      - uses: actions/cache/restore@v6
         with:
           path: ${{ env.FILENAME }}
           key: cache-${{ env.FILENAME }}-${{ github.run_id }}
