@@ -13,16 +13,16 @@ jobs:
         runs-on:
           # - ubuntu-latest
           # - ubicloud-standard-2-ubuntu-2204
-          # - ubicloud-standard-2-ubuntu-2404
-          - ubicloud-standard-2-arm-ubuntu-2204
-          - ubicloud-standard-2-arm-ubuntu-2404
+          - ubicloud-standard-2-ubuntu-2404
+          # - ubicloud-standard-2-arm-ubuntu-2204
+          # - ubicloud-standard-2-arm-ubuntu-2404
         # runs-on: [ubicloud-standard-2-ubuntu-2204, ubicloud]
     runs-on: ${{matrix.runs-on}}
     env:
       CACHE_VERSION: ${{ matrix.runs-on }}-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - run: sudo cat /etc/hosts
       - run: whoami
@@ -43,9 +43,9 @@ jobs:
           dd if=/dev/urandom of=myfolder/file1.txt bs=1M count=10
           mkdir myfolder2
           dd if=/dev/urandom of=myfolder2/file1.txt bs=1M count=15
-  
+
       - name: Restore folders and files
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             myfolder
@@ -53,19 +53,19 @@ jobs:
           key: cached_folders_${{ env.CACHE_VERSION }}
 
       - name: Save folders and files
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: |
             myfolder
             myfolder2
           key: cached_folders_${{ env.CACHE_VERSION }}
-  
+
       - run: |
           rm -rf myfolder
           rm -rf myfolder2
 
       - name: Restore folders and files
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             myfolder
