@@ -3,6 +3,7 @@ name: Test ubicloud image
 on:
   push:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   test:
