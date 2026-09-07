@@ -1,24 +1,64 @@
 name: Test ubicloud image
 
+# Falls back to the branch name on push, where the input does not exist.
+run-name: ${{ inputs.name || format('Benchmark {0}', github.ref_name) }}
+
 on:
-  push:
-    branches:
-    - enes/test-hardware
+  # push:
+    # branches:
+    # - enes/test-hardware
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "Label for this run (shown in the run list)"
+        default: ""
+      iters:
+        description: "Iterations per benchmark (for variance sampling)"
+        default: "3"
+      heavy:
+        description: "Run heavy real-world workloads (kernel build, docker build, npm ci)"
+        default: "true"
+      sustained_seconds:
+        description: "Duration of the sustained CPU/disk throttling tests"
+        default: "300"
+      vcpus:
+        description: "the number of vCPUs"
+        default: 2
 
 jobs:
   build:
     strategy:
       fail-fast: false
       matrix:
-        runs-on: [
-          ubicloud-standard-2-ubuntu-2404,
-        ]
-    name: ${{matrix.runs-on}}
+        runs-on:
+        - ubicloud-standard-${{ github.event.inputs.vcpus || '2' }}-ubuntu-2404
+        - ubicloud-premium-${{ github.event.inputs.vcpus || '2' }}-ubuntu-2404
+        # Add more indices (e.g. [1, 2, 3]) to sample across VM placements --
+        # with a single index you cannot tell a slow runner from an unlucky one.
+        index: [1]
+    name: "${{matrix.runs-on}} (#${{matrix.index}})"
     runs-on: ${{matrix.runs-on}}
     continue-on-error: true
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      # actions: write is needed to delete the throwaway cache entries
+      # this job creates; read alone would leave them filling the 10 GB budget.
+      actions: write
+    defaults:
+      run:
+        shell: bash
     env:
-      S: /tmp/bench.csv
-      SUMMARY_FILE: /tmp/benchmark_summary.md
+      BENCH_FILE: /tmp/bench.jsonl
+      ITERS: ${{ github.event.inputs.iters || '3' }}
+      HEAVY: ${{ github.event.inputs.heavy || 'true' }}
+      SUSTAINED_SECONDS: ${{ github.event.inputs.sustained_seconds || '300' }}
+      CPU_TIME: 30
+      FIO_RUNTIME: 30
+      FIO_SIZE: 1G
+      PGBENCH_SCALE: 300
+      CACHE_SIZE_MB: 1024
+      DEBIAN_FRONTEND: noninteractive
 
     services:
       postgres:
@@ -37,49 +77,271 @@ jobs:
     steps:
     - uses: actions/checkout@v6
 
-    # ── 1. System Information ────────────────────────────────────
-    - name: "System Info"
+    # ── 0. Metric helpers ────────────────────────────────────────
+    # Results are emitted as JSON lines (not key=value) so the compare job can
+    # keep units, run counts and min/max separate from the value.
+    - name: "Setup: metric helpers"
       run: |
-        CPU_MODEL=$(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | xargs || echo "N/A")
-        ARCH=$(uname -m)
-        KERNEL=$(uname -r)
-        CORES=$(nproc)
-        RAM=$(free -h | awk '/Mem:/{print $2}')
-        DISK=$(df -h / | awk 'NR==2{print $2}')
-        DISK_FS=$(df -Th / | awk 'NR==2{print $2}')
+        command -v jq >/dev/null || { sudo apt-get -qq update && sudo apt-get -qq install -y jq; }
+        : > "$BENCH_FILE"
 
-        echo "CPU Model=$CPU_MODEL" >> "$S"
-        echo "Architecture=$ARCH" >> "$S"
-        echo "Kernel=$KERNEL" >> "$S"
-        echo "Cores=$CORES" >> "$S"
-        echo "RAM=$RAM" >> "$S"
-        echo "Disk=$DISK ($DISK_FS)" >> "$S"
+        sudo tee /usr/local/bin/rec >/dev/null <<'REC'
+        #!/usr/bin/env bash
+        # rec <category> <key> <value> [unit]  -- single measurement
+        set -euo pipefail
+        # Trim first: `wc -l` and friends can pad, and a padded value would be
+        # stored as a string instead of a number.
+        jq -nc --arg c "$1" --arg k "$2" --arg v "${3:-}" --arg u "${4:-}" \
+          '($v | sub("^\\s+";"") | sub("\\s+$";"")) as $t
+           | {category:$c, key:$k, value:(try ($t|tonumber) catch $t), unit:$u, runs:1}' \
+          >> "${BENCH_FILE:-/tmp/bench.jsonl}"
+        REC
 
-        # Full info in logs
-        uname -a
-        lscpu
-        free -h
-        lsblk
+        sudo tee /usr/local/bin/recstats >/dev/null <<'STATS'
+        #!/usr/bin/env bash
+        # recstats <category> <key> [unit]  -- reads one number per line on stdin,
+        # records the median as the value plus the min/max spread.
+        set -euo pipefail
+        C=$1; K=$2; U=${3:-}
+        VALS=$(awk 'NF && $1+0==$1 {print $1}' | sort -g)
+        if [ -z "$VALS" ]; then
+          jq -nc --arg c "$C" --arg k "$K" --arg u "$U" \
+            '{category:$c,key:$k,value:"FAILED",unit:$u,runs:0}' >> "$BENCH_FILE"
+          : > /tmp/last_median
+          echo "::warning::recstats got no numeric samples for '$K' (parse failure?)"
+          exit 0
+        fi
+        read -r MN MED MX N < <(printf '%s\n' "$VALS" | awk '{v[NR]=$1} END{m=(NR%2)?v[(NR+1)/2]:(v[NR/2]+v[NR/2+1])/2; printf "%s %s %s %s\n", v[1], m, v[NR], NR}')
+        jq -nc --arg c "$C" --arg k "$K" --arg u "$U" \
+          --argjson v "$MED" --argjson mn "$MN" --argjson mx "$MX" --argjson n "$N" \
+          '{category:$c,key:$k,value:$v,unit:$u,min:$mn,max:$mx,runs:$n}' >> "$BENCH_FILE"
+        printf '%s\n' "$MED" > /tmp/last_median
+        echo "-> $K: median=$MED  min=$MN  max=$MX  $U  (n=$N)"
+        STATS
+
+        # fio wrapper: JSON output instead of grepping "bw=", and latency
+        # percentiles alongside bandwidth — bw alone hides everything that
+        # matters for a database or a test suite.
+        sudo tee /usr/local/bin/fiorun >/dev/null <<'FIOR'
+        #!/usr/bin/env bash
+        # fiorun <label> <rw> <bs> <numjobs> <iodepth> [dir]
+        set -euo pipefail
+        L=$1; RW=$2; BS=$3; J=$4; D=$5; DIR=${6:-${FIO_DIR:-/tmp/fio}}
+        OUT="/tmp/fio-json/${L}.json"
+        mkdir -p /tmp/fio-json
+        rm -rf "$DIR"; mkdir -p "$DIR"
+        fio --name="$L" --ioengine=libaio --direct=1 --bs="$BS" --iodepth="$D" \
+            --size="${FIO_SIZE:-1G}" --numjobs="$J" --rw="$RW" --group_reporting \
+            --runtime="${FIO_RUNTIME:-30}" --time_based --directory="$DIR" \
+            --percentile_list=50:95:99:99.9 \
+            --output-format=json --output="$OUT"
+        echo "--- $L: iodepth=$D numjobs=$J bs=$BS ---"
+        for OP in read write; do
+          IOPS=$(jq -r ".jobs[0].${OP}.iops // 0" "$OUT")
+          [ "$(awk -v i="$IOPS" 'BEGIN{print (i>1)?1:0}')" = "1" ] || continue
+          BW=$(jq -r ".jobs[0].${OP}.bw // 0" "$OUT")
+          DEPTH=$(jq -r "[.jobs[0].iodepth_level | to_entries[] | select(.value>0) | .key] | join(\",\")" "$OUT")
+          P50=$(jq -r ".jobs[0].${OP}.clat_ns.percentile.\"50.000000\" // 0" "$OUT")
+          P99=$(jq -r ".jobs[0].${OP}.clat_ns.percentile.\"99.000000\" // 0" "$OUT")
+          P999=$(jq -r ".jobs[0].${OP}.clat_ns.percentile.\"99.900000\" // 0" "$OUT")
+          echo "  $OP bw=$(awk -v b="$BW" 'BEGIN{printf "%.1f", b/1024}')MiB/s iops=$IOPS achieved_depths=[$DEPTH]"
+          rec io "$L $OP bw"        "$(awk -v b="$BW"   'BEGIN{printf "%.1f", b/1024}')" "MiB/s"
+          rec io "$L $OP IOPS"      "$(awk -v i="$IOPS" 'BEGIN{printf "%.0f", i}')"      "IOPS"
+          rec io "$L $OP lat p50"   "$(awk -v n="$P50"  'BEGIN{printf "%.3f", n/1e6}')"  "ms"
+          rec io "$L $OP lat p99"   "$(awk -v n="$P99"  'BEGIN{printf "%.3f", n/1e6}')"  "ms"
+          rec io "$L $OP lat p99.9" "$(awk -v n="$P999" 'BEGIN{printf "%.3f", n/1e6}')"  "ms"
+        done
+        rm -rf "$DIR"
+        FIOR
+
+        sudo chmod +x /usr/local/bin/rec /usr/local/bin/recstats /usr/local/bin/fiorun
+
+        # Background sampler: raw /proc/stat counters + PSI, one line/second.
+        # All delta maths happens at the end so the sampler itself stays cheap.
+        cat > /tmp/sampler.sh <<'SAMP'
+        #!/usr/bin/env bash
+        # epoch user nice system idle iowait irq softirq steal psi_cpu psi_io psi_mem
+        while :; do
+          CPU=$(awk '/^cpu /{printf "%s %s %s %s %s %s %s %s",$2,$3,$4,$5,$6,$7,$8,$9}' /proc/stat)
+          PSI=$(awk '/^some/{split($2,a,"=");printf "%s ",a[2]}' /proc/pressure/cpu /proc/pressure/io /proc/pressure/memory 2>/dev/null)
+          echo "$EPOCHSECONDS $CPU ${PSI:-0 0 0}"
+          sleep 1
+        done
+        SAMP
+        chmod +x /tmp/sampler.sh
+
+        # Decide where fio runs up front: if /tmp is tmpfs, every number
+        # measured there is RAM speed, not disk.
+        if [ "$(findmnt -no FSTYPE /tmp)" = "tmpfs" ]; then
+          echo "FIO_DIR=$GITHUB_WORKSPACE/fio" >> "$GITHUB_ENV"
+        else
+          echo "FIO_DIR=/tmp/fio" >> "$GITHUB_ENV"
+        fi
+
+    # ── 1. Provisioning / boot latency ───────────────────────────
+    # For a hosted runner this is a headline metric: how long from "job queued"
+    # to "first step running", and how long the VM took to boot.
+    - name: "Runner: provisioning + boot latency"
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        NOW=$(date -u +%s)
+        # There is no github.run_started_at in the github context, so read the
+        # run's real start time from the API.
+        STARTED=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+                    --jq '.run_started_at // empty' 2>/dev/null || true)
+        if [ -n "$STARTED" ]; then
+          rec runner "queue + boot (run start to job start)" "$(( NOW - $(date -u -d "$STARTED" +%s) ))" "s"
+        else
+          echo "::warning::could not read run_started_at from the API"
+        fi
+        PUSHED="${{ github.event.head_commit.timestamp }}"
+        [ -n "$PUSHED" ] && rec runner "push to job start" "$(( NOW - $(date -u -d "$PUSHED" +%s) ))" "s" || true
+        rec runner "VM uptime at job start" "$(cut -d. -f1 /proc/uptime)" "s"
+
+        echo "--- systemd-analyze ---"
+        systemd-analyze 2>/dev/null || echo "n/a"
+        BOOT=$(systemd-analyze 2>/dev/null | grep -oP 'Startup finished in .*= \K[0-9.]+(?=s)' || true)
+        [ -n "$BOOT" ] && rec runner "systemd boot time" "$BOOT" "s" || true
+        KERNEL_BOOT=$(systemd-analyze 2>/dev/null | grep -oP '\K[0-9.]+(?=s \(kernel\))' || true)
+        [ -n "$KERNEL_BOOT" ] && rec runner "kernel boot time" "$KERNEL_BOOT" "s" || true
+
+        echo "--- slowest units ---"
+        systemd-analyze blame 2>/dev/null | head -25 || true
+        echo "--- critical chain ---"
+        systemd-analyze critical-chain 2>/dev/null || true
+        echo "--- networkd timeline ---"
+        journalctl -u systemd-networkd -o short-monotonic --no-pager 2>/dev/null | tail -40 || true
+
+    # ── 2. Dependencies ──────────────────────────────────────────
+    - name: "Install all dependencies"
+      run: |
+        START=$(date +%s)
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          sysbench fio p7zip-full postgresql-client ioping \
+          ca-certificates curl git build-essential pkg-config rsync jq bc \
+          conntrack iptables socat numactl sysstat dnsutils mtr-tiny iperf3 \
+          hdparm smartmontools dmidecode pciutils \
+          bison flex libelf-dev \
+          libsqlite3-dev sqlite3 libyaml-dev zlib1g-dev libreadline-dev \
+          libffi-dev libgdbm-dev rustc libssl-dev libpq-dev \
+          redis-server postgresql postgresql-contrib \
+          default-libmysqlclient-dev libxml2-dev \
+          python3 python3-dev python3-pip python3-venv \
+          libmemcached-dev libjpeg-dev gettext
+        mkdir -p "$FIO_DIR"
+        rec setup "apt install" "$(( $(date +%s) - START ))" "s"
+
+    # ── 3. Start the resource sampler ────────────────────────────
+    # Steal time and PSI are the biggest blind spot in a throughput-only suite:
+    # they tell you whether the hypervisor is actually giving you the CPU.
+    - name: "Start resource sampler"
+      continue-on-error: true
+      run: |
+        nohup /tmp/sampler.sh > /tmp/sampler.log 2>/dev/null &
+        disown || true
+        sleep 2
+        echo "sampler running, $(wc -l < /tmp/sampler.log) samples so far"
+        echo "--- PSI at start ---"
+        cat /proc/pressure/cpu /proc/pressure/io /proc/pressure/memory
+
+    # ── 4. System information ────────────────────────────────────
+    - name: "System Info"
+      continue-on-error: true
+      run: |
+        rec system "CPU model"    "$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs || echo N/A)"
+        rec system "Architecture" "$(uname -m)"
+        rec system "Kernel"       "$(uname -r)"
+        rec system "Logical CPUs" "$(nproc)"
+        rec system "RAM"          "$(awk '/MemTotal/{printf "%.1f", $2/1048576}' /proc/meminfo)" "GiB"
+        rec system "Swap"         "$(awk '/SwapTotal/{printf "%.1f", $2/1048576}' /proc/meminfo)" "GiB"
+        rec system "Root disk"    "$(df -BG --output=size / | tail -1 | tr -dc 0-9)" "GiB"
+        rec system "Root fs"      "$(findmnt -no FSTYPE /)"
+
+        echo "--- mounts ---"
+        findmnt -no SOURCE,FSTYPE,SIZE,OPTIONS /
+        findmnt -no SOURCE,FSTYPE,SIZE,OPTIONS /tmp
+        findmnt -no SOURCE,FSTYPE,SIZE,OPTIONS "$GITHUB_WORKSPACE"
+        lsblk -o NAME,ROTA,SCHED,MODEL,SIZE,TYPE,MOUNTPOINTS
         df -Th
 
+        # If /tmp is tmpfs, every fio number measured there is RAM speed, not disk.
+        TMPFS=$(findmnt -no FSTYPE /tmp)
+        rec system "/tmp filesystem" "$TMPFS"
+        rec system "fio target directory" "$FIO_DIR"
+        [ "$TMPFS" = "tmpfs" ] && \
+          echo "::warning::/tmp is tmpfs - fio moved to the workspace volume so it measures disk, not RAM." || true
+
+        ROOTSRC=$(findmnt -no SOURCE /)
+        ROOTDEV=$(lsblk -no PKNAME "$ROOTSRC" 2>/dev/null | head -1 || true)
+        [ -n "$ROOTDEV" ] || ROOTDEV=$(basename "$ROOTSRC")
+        rec system "Root block device" "$ROOTDEV"
+        for f in queue/scheduler queue/rotational queue/nr_requests queue/max_sectors_kb queue/read_ahead_kb; do
+          [ -r "/sys/block/$ROOTDEV/$f" ] && echo "$f = $(cat "/sys/block/$ROOTDEV/$f")" || true
+        done
+        [ -r "/sys/block/$ROOTDEV/queue/rotational" ] && \
+          rec system "Root device rotational" "$(cat "/sys/block/$ROOTDEV/queue/rotational")" || true
+
+        # iodepth=256 x numjobs=4 needs 1024 in-flight AIO requests; if
+        # aio-max-nr is lower, fio silently runs at a reduced depth.
+        rec system "fs.aio-max-nr (before)" "$(cat /proc/sys/fs/aio-max-nr)"
+        sudo sysctl -w fs.aio-max-nr=1048576 >/dev/null || true
+        rec system "fs.aio-max-nr (after)" "$(cat /proc/sys/fs/aio-max-nr)"
+
+        echo "--- full system dump ---"
+        uname -a
+        free -h
+        head -20 /proc/meminfo
+
+    - name: "CPU: topology"
+      continue-on-error: true
+      run: |
+        lscpu
+        echo "--- per-CPU topology ---"
+        lscpu -e=CPU,CORE,SOCKET,NODE,ONLINE,MAXMHZ,MINMHZ || true
+        echo "--- NUMA ---"
+        numactl --hardware 2>/dev/null || echo "n/a"
+
+        # "2 vCPU" can mean two real cores or one core's two SMT threads. This
+        # decides how much multi-thread scaling you should expect.
+        PHYS=$(lscpu -p=CORE,SOCKET | grep -v '^#' | sort -u | wc -l)
+        rec system "Physical cores"      "$PHYS"
+        rec system "SMT active"          "$(cat /sys/devices/system/cpu/smt/active 2>/dev/null || echo n/a)"
+        rec system "Threads per core"    "$(lscpu | awk -F: '/Thread\(s\) per core/{print $2}' | xargs || echo n/a)"
+        rec system "Hypervisor"          "$(lscpu | awk -F: '/Hypervisor vendor/{print $2}' | xargs || echo none)"
+        rec system "Virtualization type" "$(lscpu | awk -F: '/Virtualization type/{print $2}' | xargs || echo none)"
+        for C in L1d L1i L2 L3; do
+          V=$(lscpu | awk -F: -v c="$C" '$1 ~ "^"c" cache" {print $2}' | xargs || true)
+          [ -n "$V" ] && rec system "$C cache" "$V" || true
+        done
+
+        echo "--- frequency ---"
+        grep MHz /proc/cpuinfo || true
+        cpupower frequency-info 2>/dev/null || echo "cpupower n/a"
+        cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true
+        echo "--- mitigations (they cost real throughput) ---"
+        grep -r . /sys/devices/system/cpu/vulnerabilities/ 2>/dev/null || true
+
     - name: "Docker Info"
+      continue-on-error: true
       run: |
         docker version
         docker info
+        rec system "Docker storage driver" "$(docker info -f '{{.Driver}}' 2>/dev/null || echo n/a)"
+        rec system "Docker version"        "$(docker version -f '{{.Server.Version}}' 2>/dev/null || echo n/a)"
 
-    # ── 2. Datacenter / Provider Detection ───────────────────────
+    # ── 5. Provider detection ────────────────────────────────────
     - name: "Provider Info"
+      continue-on-error: true
       run: |
-        IPINFO=$(curl -s ipinfo.io)
-        ORG=$(echo "$IPINFO" | jq -r '.org // "N/A"')
-        CITY=$(echo "$IPINFO" | jq -r '.city // "N/A"')
-        REGION=$(echo "$IPINFO" | jq -r '.region // "N/A"')
-        COUNTRY=$(echo "$IPINFO" | jq -r '.country // "N/A"')
-        MANUFACTURER=$(sudo dmidecode -s system-manufacturer 2>/dev/null || echo "N/A")
-
-        echo "Provider=$ORG" >> "$S"
-        echo "Location=$CITY, $REGION, $COUNTRY" >> "$S"
-        echo "Manufacturer=$MANUFACTURER" >> "$S"
+        IPINFO=$(curl -s --max-time 10 ipinfo.io || echo '{}')
+        rec provider "Network org"  "$(echo "$IPINFO" | jq -r '.org // "N/A"')"
+        rec provider "Location"     "$(echo "$IPINFO" | jq -r '"\(.city // "?"), \(.region // "?"), \(.country // "?")"')"
+        rec provider "Manufacturer" "$(sudo dmidecode -s system-manufacturer 2>/dev/null || echo N/A)"
+        rec provider "Product name" "$(sudo dmidecode -s system-product-name 2>/dev/null || echo N/A)"
+        rec provider "BIOS vendor"  "$(sudo dmidecode -s bios-vendor 2>/dev/null || echo N/A)"
 
     - name: "Provider: AWS Metadata"
       continue-on-error: true
@@ -90,310 +352,873 @@ jobs:
       run: cloud-init query --all 2>/dev/null || cat /etc/cloud/cloud.cfg.d/*.cfg 2>/dev/null || echo "No cloud-init info available"
 
     - name: "Provider: Environment Variables"
+      continue-on-error: true
       run: printenv | sort
 
     - name: "Provider: PCI Devices"
       continue-on-error: true
       run: lspci -vv 2>/dev/null || echo "lspci not available"
 
-    - name: Dump GitHub Actions Context
+    - name: "Dump GitHub Actions Context"
+      continue-on-error: true
       uses: crazy-max/ghaction-dump-context@v2
 
-    # ── 3. Install All Dependencies ────────────────────────────────
-    - name: Install all dependencies
-      run: |
-        START=$(date +%s)
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
-          sysbench fio p7zip-full postgresql-client \
-          ca-certificates curl git build-essential pkg-config rsync jq \
-          conntrack iptables socat \
-          libsqlite3-dev sqlite3 libyaml-dev zlib1g-dev libreadline-dev \
-          libffi-dev libgdbm-dev rustc libssl-dev libpq-dev \
-          redis-server postgresql postgresql-contrib \
-          default-libmysqlclient-dev libxml2-dev \
-          python3 python3-dev python3-pip python3-venv \
-          libmemcached-dev libjpeg-dev gettext
-        mkdir -p /tmp/fio
-        DURATION=$(($(date +%s) - START))
-        echo "Setup: apt install=${DURATION}s" >> "$S"
-
-    # ── 4. CPU Performance ───────────────────────────────────────
+    # ── 6. CPU performance ───────────────────────────────────────
     - name: "CPU: sysbench single-thread"
+      continue-on-error: true
       run: |
-        OUTPUT=$(sysbench cpu --threads=1 --time=30 run)
-        echo "$OUTPUT"
-        EPS=$(echo "$OUTPUT" | grep "events per second" | awk '{print $NF}')
-        echo "CPU: sysbench 1-thread=$EPS events/sec" >> "$S"
+        : > /tmp/vals
+        for i in $(seq "$ITERS"); do
+          OUT=$(sysbench cpu --threads=1 --time="$CPU_TIME" run)
+          echo "$OUT"
+          echo "$OUT" | awk '/events per second/{print $NF}' >> /tmp/vals
+        done
+        recstats cpu "sysbench 1-thread" "events/s" < /tmp/vals
+        echo "ST_EPS=$(cat /tmp/last_median)" >> "$GITHUB_ENV"
 
     - name: "CPU: sysbench multi-thread"
+      continue-on-error: true
       run: |
-        THREADS=$(nproc)
-        OUTPUT=$(sysbench cpu --threads=$THREADS --time=30 run)
-        echo "$OUTPUT"
-        EPS=$(echo "$OUTPUT" | grep "events per second" | awk '{print $NF}')
-        echo "CPU: sysbench ${THREADS}-thread=$EPS events/sec" >> "$S"
+        : > /tmp/vals
+        for i in $(seq "$ITERS"); do
+          OUT=$(sysbench cpu --threads="$(nproc)" --time="$CPU_TIME" run)
+          echo "$OUT"
+          echo "$OUT" | awk '/events per second/{print $NF}' >> /tmp/vals
+        done
+        recstats cpu "sysbench $(nproc)-thread" "events/s" < /tmp/vals
+        echo "MT_EPS=$(cat /tmp/last_median)" >> "$GITHUB_ENV"
+
+    - name: "CPU: multi-thread scaling efficiency"
+      continue-on-error: true
+      run: |
+        # ~1.0 means real dedicated cores; ~0.55 means you are on SMT siblings.
+        EFF=$(awk -v mt="$MT_EPS" -v st="$ST_EPS" -v n="$(nproc)" \
+          'BEGIN{ if (st>0 && n>0) printf "%.3f", mt/(st*n); else print 0 }')
+        rec cpu "MT scaling efficiency" "$EFF" "x"
+        echo "single=$ST_EPS multi=$MT_EPS nproc=$(nproc) efficiency=$EFF"
+
+    - name: "CPU: sustained load (burst / throttling detection)"
+      continue-on-error: true
+      run: |
+        # Every 30s benchmark sits inside the burst window of most shared-core
+        # instances. Compare the first minute against the last.
+        OUT=$(sysbench cpu --threads="$(nproc)" --time="$SUSTAINED_SECONDS" --report-interval=10 run)
+        echo "$OUT"
+        echo "$OUT" | grep -oP 'eps:\s*\K[\d.]+' > /tmp/eps.log || true
+        N=$(wc -l < /tmp/eps.log)
+        if [ "$N" -ge 12 ]; then
+          FIRST=$(head -6 /tmp/eps.log | awk '{s+=$1} END{printf "%.2f", s/NR}')
+          LAST=$(tail -6 /tmp/eps.log | awk '{s+=$1} END{printf "%.2f", s/NR}')
+          rec cpu "sustained first 60s"  "$FIRST" "events/s"
+          rec cpu "sustained last 60s"   "$LAST"  "events/s"
+          rec cpu "sustained/burst ratio" "$(awk -v f="$FIRST" -v l="$LAST" 'BEGIN{printf "%.3f", (f>0)?l/f:0}')" "x"
+        fi
+        echo "--- frequency after sustained load ---"
+        grep MHz /proc/cpuinfo || true
+        echo "--- thermal / throttle counters ---"
+        grep -h . /sys/class/thermal/thermal_zone*/temp 2>/dev/null || echo "no thermal zones"
 
     - name: "CPU: openssl speed (crypto)"
+      continue-on-error: true
       run: |
-        OUTPUT=$(openssl speed -seconds 10 -multi $(nproc) sha256 aes-256-cbc 2>&1)
+        OUTPUT=$(openssl speed -seconds 10 -multi "$(nproc)" sha256 aes-256-cbc 2>&1)
         echo "$OUTPUT"
-        SHA256=$(echo "$OUTPUT" | grep "^sha256" | awk '{print $NF}')
-        AES=$(echo "$OUTPUT" | grep "^aes-256-cbc" | awk '{print $NF}')
-        echo "CPU: OpenSSL SHA256=${SHA256}k (16K block)" >> "$S"
-        echo "CPU: OpenSSL AES-256-CBC=${AES}k (16K block)" >> "$S"
+        # OpenSSL 3.x prints "AES-256-CBC" in uppercase, so match case-insensitively.
+        SHA256=$(echo "$OUTPUT" | grep -i '^sha256' | tail -1 | awk '{print $NF}' | tr -dc '0-9.')
+        AES=$(echo "$OUTPUT"    | grep -i '^aes-256-cbc' | tail -1 | awk '{print $NF}' | tr -dc '0-9.')
+        [ -n "$SHA256" ] && rec cpu "OpenSSL SHA256 (16K block)"      "$SHA256" "1000s of bytes/s" || echo "::warning::SHA256 parse failed"
+        [ -n "$AES" ]    && rec cpu "OpenSSL AES-256-CBC (16K block)" "$AES"    "1000s of bytes/s" || echo "::warning::AES parse failed"
 
     - name: "CPU: 7-Zip compression benchmark"
+      continue-on-error: true
       run: |
-        OUTPUT=$(7z b)
-        echo "$OUTPUT"
-        TOT_LINE=$(echo "$OUTPUT" | grep "^Tot:")
-        TOTAL=$(echo "$TOT_LINE" | awk '{print $4}')
-        echo "CPU: 7-Zip=$TOTAL MIPS" >> "$S"
+        : > /tmp/vals
+        for i in $(seq "$ITERS"); do
+          OUT=$(7z b)
+          echo "$OUT"
+          echo "$OUT" | awk '/^Tot:/{print $4}' >> /tmp/vals
+        done
+        recstats cpu "7-Zip" "MIPS" < /tmp/vals
 
     - name: "CPU: Install Passmark (x86 only)"
       if: runner.arch == 'X64'
+      continue-on-error: true
       run: |
         sudo apt-get install -y libncurses5 || true
         wget -q "https://www.passmark.com/downloads/pt_linux_x64.zip" -O pt.zip
-        unzip pt.zip
+        unzip -o pt.zip
 
     - name: "CPU: Bypass libncurses5 (Ubuntu 24.04 x86)"
       if: runner.arch == 'X64' && contains(matrix.runs-on, '2404')
+      continue-on-error: true
       run: |
-        sudo ln -s /usr/lib/x86_64-linux-gnu/libncurses.so.6 /usr/lib/x86_64-linux-gnu/libncurses.so.5
-        sudo ln -s /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5
+        sudo ln -sf /usr/lib/x86_64-linux-gnu/libncurses.so.6 /usr/lib/x86_64-linux-gnu/libncurses.so.5
+        sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5
         sudo ldconfig
 
     - name: "CPU: Run Passmark (x86 only)"
       if: runner.arch == 'X64'
+      continue-on-error: true
       run: |
         TERM=xterm ./PerformanceTest/PerformanceTest_Linux_x86-64 -p 2 -d 2 -i 2 -r 1
-        SCORE=$(grep "SUMM_CPU" results_cpu.yml | head -1 | awk '{print $2}')
-        SINGLE=$(grep "CPU_SINGLETHREAD" results_cpu.yml | head -1 | awk '{print $2}')
-        echo "CPU: Passmark CPU Mark=$SCORE" >> "$S"
-        echo "CPU: Passmark Single Thread=$SINGLE" >> "$S"
+        rec cpu "Passmark CPU Mark"     "$(awk '/SUMM_CPU/{print $2; exit}' results_cpu.yml)"
+        rec cpu "Passmark Single Thread" "$(awk '/CPU_SINGLETHREAD/{print $2; exit}' results_cpu.yml)"
 
-    # ── 5. Memory Performance ────────────────────────────────────
-    - name: "Memory: sysbench read"
+    # ── 7. Memory performance ────────────────────────────────────
+    - name: "Memory: sysbench (1 MiB blocks, actually hits RAM)"
+      continue-on-error: true
       run: |
-        OUTPUT=$(sysbench memory --memory-oper=read --threads=$(nproc) --time=30 run)
-        echo "$OUTPUT"
-        THROUGHPUT=$(echo "$OUTPUT" | grep "transferred" | grep -oP '[\d.]+\s+MiB/sec' | head -1)
-        echo "Memory: read=$THROUGHPUT" >> "$S"
+        # sysbench's default --memory-block-size=1K fits entirely in L1, so the
+        # default numbers are cache bandwidth, not memory bandwidth.
+        for OPER in read write; do
+          : > /tmp/vals
+          for i in $(seq "$ITERS"); do
+            OUT=$(sysbench memory --memory-oper="$OPER" --memory-block-size=1M \
+                    --memory-total-size=100G --threads="$(nproc)" --time=30 run)
+            echo "$OUT"
+            echo "$OUT" | grep -oP '\(\K[\d.]+(?= MiB/sec\))' >> /tmp/vals
+          done
+          recstats memory "sysbench $OPER (1M block)" "MiB/s" < /tmp/vals
+        done
 
-    - name: "Memory: sysbench write"
+    - name: "Memory: sysbench (1 KiB blocks, cache-resident reference)"
+      continue-on-error: true
       run: |
-        OUTPUT=$(sysbench memory --memory-oper=write --threads=$(nproc) --time=30 run)
-        echo "$OUTPUT"
-        THROUGHPUT=$(echo "$OUTPUT" | grep "transferred" | grep -oP '[\d.]+\s+MiB/sec' | head -1)
-        echo "Memory: write=$THROUGHPUT" >> "$S"
+        # Kept as a reference point: the gap between this and the 1M result is
+        # your cache-vs-DRAM ratio.
+        OUT=$(sysbench memory --memory-oper=read --memory-block-size=1K \
+                --memory-total-size=100G --threads="$(nproc)" --time=15 run)
+        echo "$OUT"
+        rec memory "sysbench read (1K block, cache)" \
+          "$(echo "$OUT" | grep -oP '\(\K[\d.]+(?= MiB/sec\))')" "MiB/s"
 
-    # ── 6. I/O Performance ───────────────────────────────────────
-    - name: "I/O: fio sequential write"
+    - name: "Memory: STREAM (Copy / Scale / Add / Triad)"
+      continue-on-error: true
       run: |
-        OUTPUT=$(fio --name=seq-write --ioengine=libaio --direct=1 --bs=1M \
-          --size=1G --numjobs=1 --rw=write --group_reporting --runtime=30 --time_based \
-          --directory=/tmp/fio)
-        echo "$OUTPUT"
-        BW=$(echo "$OUTPUT" | grep "WRITE:" | grep -oP 'bw=\S+' | head -1)
-        echo "I/O: fio seq write=$BW" >> "$S"
-        rm -rf /tmp/fio && mkdir -p /tmp/fio
+        # The standard memory-bandwidth benchmark. Arrays must be several times
+        # larger than L3, so size them from actual RAM.
+        curl -sSf --max-time 60 -o /tmp/stream.c https://www.cs.virginia.edu/stream/FTP/Code/stream.c
+        RAM_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+        # 3 arrays of doubles, target ~25% of RAM total
+        ASIZE=$(awk -v k="$RAM_KB" 'BEGIN{printf "%d", (k*1024*0.25)/8/3}')
+        echo "STREAM_ARRAY_SIZE=$ASIZE (~$(awk -v a="$ASIZE" 'BEGIN{printf "%.2f", a*8*3/1073741824}') GiB total)"
+        gcc -O3 -march=native -fopenmp -DSTREAM_ARRAY_SIZE="$ASIZE" -DNTIMES=20 \
+          /tmp/stream.c -o /tmp/stream \
+          || gcc -O3 -fopenmp -DSTREAM_ARRAY_SIZE="$ASIZE" -DNTIMES=20 /tmp/stream.c -o /tmp/stream
+        OUT=$(OMP_NUM_THREADS=$(nproc) /tmp/stream)
+        echo "$OUT"
+        for OP in Copy Scale Add Triad; do
+          V=$(echo "$OUT" | awk -v o="$OP:" '$1==o{print $2}')
+          [ -n "$V" ] && rec memory "STREAM $OP" "$V" "MB/s" || true
+        done
 
-    - name: "I/O: fio sequential read"
+    - name: "Memory: latency vs working-set curve"
+      continue-on-error: true
       run: |
-        OUTPUT=$(fio --name=seq-read --ioengine=libaio --direct=1 --bs=1M \
-          --size=1G --numjobs=1 --rw=read --group_reporting --runtime=30 --time_based \
-          --directory=/tmp/fio)
-        echo "$OUTPUT"
-        BW=$(echo "$OUTPUT" | grep "READ:" | grep -oP 'bw=\S+' | head -1)
-        echo "I/O: fio seq read=$BW" >> "$S"
-        rm -rf /tmp/fio && mkdir -p /tmp/fio
+        # Dependency-free pointer chase, one load per cache line. The knees in
+        # this curve reveal the real cache sizes and whether you are getting a
+        # full L3 slice or sharing one with a neighbour.
+        cat > /tmp/memlat.c <<'MEMLAT'
+        #define _GNU_SOURCE
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <time.h>
+        #define LINE 64
+        int main(int argc, char **argv) {
+            size_t kb = strtoul(argv[1], NULL, 10);
+            size_t lines = kb * 1024 / LINE;
+            if (lines < 2) return 1;
+            size_t *a = aligned_alloc(LINE, lines * LINE);
+            size_t *idx = malloc(lines * sizeof(size_t));
+            if (!a || !idx) return 1;
+            for (size_t i = 0; i < lines; i++) idx[i] = i;
+            srand(1);
+            for (size_t i = lines - 1; i > 0; i--) {
+                size_t j = (size_t)((double)rand() / ((double)RAND_MAX + 1) * (i + 1));
+                size_t t = idx[i]; idx[i] = idx[j]; idx[j] = t;
+            }
+            /* build one big random cycle over cache lines */
+            for (size_t i = 0; i < lines; i++)
+                a[idx[i] * (LINE / sizeof(size_t))] = idx[(i + 1) % lines] * (LINE / sizeof(size_t));
+            size_t p = 0, iters = 20000000;
+            for (size_t i = 0; i < lines; i++) p = a[p];      /* warm */
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            for (size_t i = 0; i < iters; i++) p = a[p];
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double ns = ((t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec)) / (double)iters;
+            printf("%zu %.2f\n", kb, ns);
+            if (p == (size_t)-1) fprintf(stderr, "x");        /* defeat DCE */
+            return 0;
+        }
+        MEMLAT
+        gcc -O2 /tmp/memlat.c -o /tmp/memlat
+        echo "working set (KiB) | latency (ns)"
+        for KB in 16 64 256 1024 4096 16384 65536 262144; do
+          AVAIL=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+          [ "$KB" -gt $(( AVAIL / 3 )) ] && continue
+          RES=$(/tmp/memlat "$KB")
+          echo "$RES"
+          rec memory "latency @ ${KB}KiB" "$(echo "$RES" | awk '{print $2}')" "ns"
+        done
 
-    - name: "I/O: fio random read 4K"
+    # ── 8. I/O performance ───────────────────────────────────────
+    # All fio steps go through the `fiorun` helper: JSON output (no fragile
+    # `grep -oP 'bw=\S+'`) and p50/p99/p99.9 latency alongside bandwidth.
+    - name: "I/O: fio suite (iodepth=1)"
+      continue-on-error: true
       run: |
-        OUTPUT=$(fio --name=rand-read-4k --ioengine=libaio --direct=1 --bs=4k \
-          --size=1G --numjobs=4 --rw=randread --group_reporting --runtime=30 --time_based \
-          --directory=/tmp/fio)
-        echo "$OUTPUT"
-        BW=$(echo "$OUTPUT" | grep "READ:" | grep -oP 'bw=\S+' | head -1)
-        echo "I/O: fio rand read 4K=$BW" >> "$S"
-        rm -rf /tmp/fio && mkdir -p /tmp/fio
+        fiorun seq-write   write     1M 1 1
+        fiorun seq-read    read      1M 1 1
+        fiorun rand-read   randread  4k 4 1
+        fiorun rand-write  randwrite 4k 4 1
+        fiorun rand-rw     randrw    4k 4 1
 
-    - name: "I/O: fio random write 4K"
+    - name: "I/O: fio suite (iodepth=256)"
+      continue-on-error: true
       run: |
-        OUTPUT=$(fio --name=rand-write-4k --ioengine=libaio --direct=1 --bs=4k \
-          --size=1G --numjobs=4 --rw=randwrite --group_reporting --runtime=30 --time_based \
-          --directory=/tmp/fio)
-        echo "$OUTPUT"
-        BW=$(echo "$OUTPUT" | grep "WRITE:" | grep -oP 'bw=\S+' | head -1)
-        echo "I/O: fio rand write 4K=$BW" >> "$S"
-        rm -rf /tmp/fio && mkdir -p /tmp/fio
+        fiorun seq-write-d256   write     1M 1 256
+        fiorun seq-read-d256    read      1M 1 256
+        fiorun rand-read-d256   randread  4k 4 256
+        fiorun rand-write-d256  randwrite 4k 4 256
+        fiorun rand-rw-d256     randrw    4k 4 256
 
-    - name: "I/O: fio mixed random read/write 4K"
+    - name: "I/O: fio on the workspace volume (may be a different device)"
+      continue-on-error: true
       run: |
-        OUTPUT=$(fio --name=rand-rw-4k --ioengine=libaio --direct=1 --bs=4k \
-          --size=1G --numjobs=4 --rw=randrw --rwmixread=70 --group_reporting --runtime=30 --time_based \
-          --directory=/tmp/fio)
-        echo "$OUTPUT"
-        READ_BW=$(echo "$OUTPUT" | grep "READ:" | grep -oP 'bw=\S+' | head -1)
-        WRITE_BW=$(echo "$OUTPUT" | grep "WRITE:" | grep -oP 'bw=\S+' | head -1)
-        echo "I/O: fio mixed r/w 4K read=$READ_BW" >> "$S"
-        echo "I/O: fio mixed r/w 4K write=$WRITE_BW" >> "$S"
-        rm -rf /tmp/fio && mkdir -p /tmp/fio
+        mkdir -p "$GITHUB_WORKSPACE/fio-ws"
+        findmnt -no SOURCE,FSTYPE --target "$GITHUB_WORKSPACE"
+        fiorun ws-rand-read  randread  4k 4 32 "$GITHUB_WORKSPACE/fio-ws"
+        fiorun ws-rand-write randwrite 4k 4 32 "$GITHUB_WORKSPACE/fio-ws"
 
-    - name: "I/O: fio sequential write (iodepth=256)"
+    - name: "I/O: fsync latency (database commit path)"
+      continue-on-error: true
       run: |
-        OUTPUT=$(fio --name=seq-write-deep --ioengine=libaio --direct=1 --bs=1M --iodepth=256 \
-          --size=1G --numjobs=1 --rw=write --group_reporting --runtime=30 --time_based \
-          --directory=/tmp/fio)
-        echo "$OUTPUT"
-        BW=$(echo "$OUTPUT" | grep "WRITE:" | grep -oP 'bw=\S+' | head -1)
-        echo "I/O: fio seq write (d256)=$BW" >> "$S"
-        rm -rf /tmp/fio && mkdir -p /tmp/fio
+        # Postgres commit latency is bounded by this, not by streaming bandwidth.
+        rm -rf "$FIO_DIR"; mkdir -p "$FIO_DIR"
+        fio --name=fsync-lat --ioengine=sync --fsync=1 --bs=4k --iodepth=1 \
+            --size=512M --numjobs=1 --rw=write --runtime=30 --time_based \
+            --directory="$FIO_DIR" --percentile_list=50:95:99:99.9 \
+            --output-format=json --output=/tmp/fio-json/fsync.json
+        rec io "fsync IOPS"      "$(jq -r '.jobs[0].write.iops|floor' /tmp/fio-json/fsync.json)" "IOPS"
+        rec io "fsync lat p50"   "$(jq -r '.jobs[0].sync.lat_ns.percentile."50.000000"/1e6' /tmp/fio-json/fsync.json)" "ms"
+        rec io "fsync lat p99"   "$(jq -r '.jobs[0].sync.lat_ns.percentile."99.000000"/1e6' /tmp/fio-json/fsync.json)" "ms"
+        rec io "fsync lat p99.9" "$(jq -r '.jobs[0].sync.lat_ns.percentile."99.900000"/1e6' /tmp/fio-json/fsync.json)" "ms"
+        rm -rf "$FIO_DIR"
 
-    - name: "I/O: fio sequential read (iodepth=256)"
+    - name: "I/O: small-file / metadata ops"
+      continue-on-error: true
       run: |
-        OUTPUT=$(fio --name=seq-read-deep --ioengine=libaio --direct=1 --bs=1M --iodepth=256 \
-          --size=1G --numjobs=1 --rw=read --group_reporting --runtime=30 --time_based \
-          --directory=/tmp/fio)
-        echo "$OUTPUT"
-        BW=$(echo "$OUTPUT" | grep "READ:" | grep -oP 'bw=\S+' | head -1)
-        echo "I/O: fio seq read (d256)=$BW" >> "$S"
-        rm -rf /tmp/fio && mkdir -p /tmp/fio
+        # CI is dominated by thousands of tiny files, not by 1M sequential.
+        rm -rf "$FIO_DIR"; mkdir -p "$FIO_DIR"
+        fio --name=smallfiles --ioengine=sync --bs=4k --rw=randwrite \
+            --nrfiles=10000 --filesize=32k --numjobs=4 --group_reporting \
+            --runtime=30 --time_based --directory="$FIO_DIR" \
+            --output-format=json --output=/tmp/fio-json/smallfiles.json
+        rec io "small-file 4k writes" "$(jq -r '.jobs[0].write.iops|floor' /tmp/fio-json/smallfiles.json)" "IOPS"
+        rm -rf "$FIO_DIR"
 
-    - name: "I/O: fio random read 4K (iodepth=256)"
+    - name: "I/O: sustained write with bandwidth timeline"
+      continue-on-error: true
       run: |
-        OUTPUT=$(fio --name=rand-read-4k-deep --ioengine=libaio --direct=1 --bs=4k --iodepth=256 \
-          --size=1G --numjobs=4 --rw=randread --group_reporting --runtime=30 --time_based \
-          --directory=/tmp/fio)
-        echo "$OUTPUT"
-        BW=$(echo "$OUTPUT" | grep "READ:" | grep -oP 'bw=\S+' | head -1)
-        echo "I/O: fio rand read 4K (d256)=$BW" >> "$S"
-        rm -rf /tmp/fio && mkdir -p /tmp/fio
+        # Catches burst-credit cliffs that a 30s run always hides.
+        rm -rf "$FIO_DIR"; mkdir -p "$FIO_DIR"
+        FREE_GB=$(df -BG --output=avail "$FIO_DIR" | tail -1 | tr -dc 0-9)
+        SZ=$(( FREE_GB / 3 )); [ "$SZ" -gt 20 ] && SZ=20; [ "$SZ" -lt 2 ] && SZ=2
+        echo "sustained write: ${SZ}G for ${SUSTAINED_SECONDS}s"
+        fio --name=sustained --ioengine=libaio --direct=1 --bs=1M --iodepth=32 \
+            --size="${SZ}G" --numjobs=1 --rw=write \
+            --runtime="$SUSTAINED_SECONDS" --time_based --directory="$FIO_DIR" \
+            --write_bw_log=/tmp/fio-json/sustained --log_avg_msec=1000 \
+            --output-format=json --output=/tmp/fio-json/sustained.json
+        LOG=/tmp/fio-json/sustained_bw.1.log
+        if [ -f "$LOG" ]; then
+          FIRST=$(awk -F, 'NR<=60{s+=$2;n++} END{if(n)printf "%.0f", s/n/1024}' "$LOG")
+          LAST=$(awk -F, '{v[NR]=$2} END{for(i=(NR>60?NR-59:1);i<=NR;i++){s+=v[i];n++}; if(n)printf "%.0f", s/n/1024}' "$LOG")
+          MIN=$(awk -F, 'NR>5{print $2}' "$LOG" | sort -n | head -1 | awk '{printf "%.0f", $1/1024}')
+          rec io "sustained write first 60s" "$FIRST" "MiB/s"
+          rec io "sustained write last 60s"  "$LAST"  "MiB/s"
+          rec io "sustained write worst 1s"  "$MIN"   "MiB/s"
+          rec io "sustained write ratio"     "$(awk -v f="$FIRST" -v l="$LAST" 'BEGIN{printf "%.3f", (f>0)?l/f:0}')" "x"
+          echo "--- bandwidth timeline (10s buckets, MiB/s) ---"
+          awk -F, '{b=int($1/10000); s[b]+=$2; n[b]++} END{for(i=0;i<=b;i++) if(n[i]) printf "%4ds %8.0f\n", i*10, s[i]/n[i]/1024}' "$LOG"
+        fi
+        rm -rf "$FIO_DIR"
 
-    - name: "I/O: fio random write 4K (iodepth=256)"
+    - name: "I/O: ioping request latency"
+      continue-on-error: true
       run: |
-        OUTPUT=$(fio --name=rand-write-4k-deep --ioengine=libaio --direct=1 --bs=4k --iodepth=256 \
-          --size=1G --numjobs=4 --rw=randwrite --group_reporting --runtime=30 --time_based \
-          --directory=/tmp/fio)
-        echo "$OUTPUT"
-        BW=$(echo "$OUTPUT" | grep "WRITE:" | grep -oP 'bw=\S+' | head -1)
-        echo "I/O: fio rand write 4K (d256)=$BW" >> "$S"
-        rm -rf /tmp/fio && mkdir -p /tmp/fio
-
-    - name: "I/O: fio mixed random read/write 4K (iodepth=256)"
-      run: |
-        OUTPUT=$(fio --name=rand-rw-4k-deep --ioengine=libaio --direct=1 --bs=4k --iodepth=256 \
-          --size=1G --numjobs=4 --rw=randrw --rwmixread=70 --group_reporting --runtime=30 --time_based \
-          --directory=/tmp/fio)
-        echo "$OUTPUT"
-        READ_BW=$(echo "$OUTPUT" | grep "READ:" | grep -oP 'bw=\S+' | head -1)
-        WRITE_BW=$(echo "$OUTPUT" | grep "WRITE:" | grep -oP 'bw=\S+' | head -1)
-        echo "I/O: fio mixed r/w 4K read (d256)=$READ_BW" >> "$S"
-        echo "I/O: fio mixed r/w 4K write (d256)=$WRITE_BW" >> "$S"
-        rm -rf /tmp/fio
+        mkdir -p "$FIO_DIR"
+        OUT=$(ioping -c 50 -D "$FIO_DIR")
+        echo "$OUT"
+        # "min/avg/max/mdev = 63.5 us / 84.4 us / 1.05 ms / 41.2 us" -- each
+        # value carries its own unit, so normalise every one of them to ms.
+        echo "$OUT" | grep -oP 'min/avg/max/mdev = \K.*' | awk -F'/' '{
+          for (i = 1; i <= 4; i++) {
+            split($i, f, " "); v = f[1] + 0; u = f[2]
+            if (u == "ns") v /= 1000000; else if (u == "us") v /= 1000; else if (u == "s") v *= 1000
+            printf "%s %.4f\n", (i==1 ? "min" : i==2 ? "avg" : i==3 ? "max" : "mdev"), v
+          }
+        }' > /tmp/ioping.txt
+        cat /tmp/ioping.txt
+        while read -r K V; do rec io "ioping $K" "$V" "ms"; done < /tmp/ioping.txt
+        rm -rf "$FIO_DIR"
 
     - name: "I/O: dd sequential write"
-      run: |
-        OUTPUT=$(dd if=/dev/zero of=./dd_test bs=1M count=1024 conv=fdatasync 2>&1)
-        echo "$OUTPUT"
-        SPEED=$(echo "$OUTPUT" | grep -oP '[\d.]+ [MGT]B/s' | tail -1)
-        echo "I/O: dd write=$SPEED" >> "$S"
-        rm -f ./dd_test
-
-    # ── 7. Network Performance ───────────────────────────────────
-    - name: "Network: Download speed test"
-      run: |
-        OUTPUT=$(curl -o /dev/null -w '%{speed_download} %{time_total} %{size_download}' -s \
-          https://releases.ubuntu.com/24.04/ubuntu-24.04.2-live-server-amd64.iso.zsync)
-        SPEED=$(echo "$OUTPUT" | awk '{printf "%.0f", $1}')
-        echo "Network: download=$SPEED bytes/sec" >> "$S"
-
-    # ── 8. PostgreSQL Performance ────────────────────────────────
-    - name: "PostgreSQL: Initialize pgbench (scale 50)"
-      run: |
-        PGPASSWORD=postgres pgbench -i -s 50 -h localhost -U postgres bench
-
-    - name: "PostgreSQL: Read-only benchmark"
-      run: |
-        OUTPUT=$(PGPASSWORD=postgres pgbench -h localhost -U postgres -S -c 10 -j $(nproc) -T 60 bench)
-        echo "$OUTPUT"
-        TPS=$(echo "$OUTPUT" | grep -oP 'tps = \K[\d.]+')
-        echo "PostgreSQL: read-only=$TPS TPS" >> "$S"
-
-    - name: "PostgreSQL: Read-write benchmark (TPC-B)"
-      run: |
-        OUTPUT=$(PGPASSWORD=postgres pgbench -h localhost -U postgres -c 10 -j $(nproc) -T 60 bench)
-        echo "$OUTPUT"
-        TPS=$(echo "$OUTPUT" | grep -oP 'tps = \K[\d.]+')
-        echo "PostgreSQL: read-write=$TPS TPS" >> "$S"
-
-    # ── 9. CI Test Workloads ────────────────────────────────────
-    # - name: "CI Test: Kubernetes (build + test)"
-    #   run: |
-    #     OUTPUT=$(bash ci-tests/01-k8s.sh)
-    #     echo "$OUTPUT"
-    #     SETUP=$(echo "$OUTPUT" | grep "^SETUP_DURATION=" | cut -d= -f2)
-    #     TEST=$(echo "$OUTPUT" | grep "^TEST_DURATION=" | cut -d= -f2)
-    #     echo "CI Test: K8s setup=${SETUP}s" >> "$S"
-    #     echo "CI Test: K8s test=${TEST}s" >> "$S"
-
-    # - name: "CI Test: Ruby on Rails (build + test)"
-    #   run: |
-    #     OUTPUT=$(bash ci-tests/02-ruby-on-rails.sh)
-    #     echo "$OUTPUT"
-    #     SETUP=$(echo "$OUTPUT" | grep "^SETUP_DURATION=" | cut -d= -f2)
-    #     TEST=$(echo "$OUTPUT" | grep "^TEST_DURATION=" | cut -d= -f2)
-    #     echo "CI Test: Rails setup=${SETUP}s" >> "$S"
-    #     echo "CI Test: Rails test=${TEST}s" >> "$S"
-
-    # - name: "CI Test: Django (build + test)"
-    #   run: |
-    #     OUTPUT=$(bash ci-tests/03-django.sh)
-    #     echo "$OUTPUT"
-    #     SETUP=$(echo "$OUTPUT" | grep "^SETUP_DURATION=" | cut -d= -f2)
-    #     TEST=$(echo "$OUTPUT" | grep "^TEST_DURATION=" | cut -d= -f2)
-    #     echo "CI Test: Django setup=${SETUP}s" >> "$S"
-    #     echo "CI Test: Django test=${TEST}s" >> "$S"
-
-    # ── 10. Ping (may fail on some runners) ──────────────────────
-    - name: "Network: Ping latency (github.com)"
       continue-on-error: true
       run: |
-        OUTPUT=$(ping -c 10 github.com)
-        echo "$OUTPUT"
-        AVG=$(echo "$OUTPUT" | grep "rtt\|round-trip" | grep -oP '[\d.]+/[\d.]+/[\d.]+' | cut -d/ -f2)
-        echo "Network: ping github.com=${AVG} ms" >> "$S"
+        : > /tmp/vals
+        for i in $(seq "$ITERS"); do
+          OUT=$(dd if=/dev/zero of=./dd_test bs=1M count=1024 conv=fdatasync 2>&1)
+          echo "$OUT"
+          echo "$OUT" | awk '/copied|bytes/{for(j=1;j<=NF;j++) if($j=="MB/s"||$j=="GB/s"){v=$(j-1); if($j=="GB/s") v*=1000; print v}}' >> /tmp/vals
+          rm -f ./dd_test
+        done
+        recstats io "dd write 1GiB" "MB/s" < /tmp/vals
 
-    - name: "Network: Ping latency (8.8.8.8)"
+    # ── 9. Network performance ───────────────────────────────────
+    - name: "Network: throughput to the endpoints CI actually uses"
       continue-on-error: true
       run: |
-        OUTPUT=$(ping -c 10 8.8.8.8)
-        echo "$OUTPUT"
-        AVG=$(echo "$OUTPUT" | grep "rtt\|round-trip" | grep -oP '[\d.]+/[\d.]+/[\d.]+' | cut -d/ -f2)
-        echo "Network: ping 8.8.8.8=${AVG} ms" >> "$S"
+        dl() {
+          local NAME=$1 URL=$2 SPEED
+          : > /tmp/vals
+          for i in $(seq "$ITERS"); do
+            # curl still writes its -w output when it times out, so capture
+            # that and take the last line instead of appending a fallback to it.
+            SPEED=$(curl -sL -o /dev/null -w '%{speed_download}\n' --max-time 60 "$URL" 2>/dev/null | tail -1)
+            [ -n "$SPEED" ] || SPEED=0
+            echo "$NAME attempt $i: $(awk -v s="$SPEED" 'BEGIN{printf "%.1f", s/1048576}') MiB/s"
+            awk -v s="$SPEED" 'BEGIN{printf "%.2f\n", s/1048576}' >> /tmp/vals
+          done
+          recstats network "download $NAME" "MiB/s" < /tmp/vals
+        }
+        dl "ubuntu releases" "https://releases.ubuntu.com/24.04/ubuntu-24.04.2-live-server-amd64.iso.zsync"
+        dl "github codeload" "https://codeload.github.com/torvalds/linux/tar.gz/refs/tags/v6.6"
+        dl "go.dev CDN"      "https://go.dev/dl/go1.22.5.linux-amd64.tar.gz"
+        dl "npm registry"    "https://registry.npmjs.org/typescript/-/typescript-5.5.4.tgz"
+        dl "pypi"            "https://files.pythonhosted.org/packages/source/n/numpy/numpy-1.26.4.tar.gz"
 
-    # ── Write per-job summary + upload artifact ──────────────────
-    - name: "Write summary"
-      if: false
+    - name: "Network: DNS resolution latency"
+      continue-on-error: true
       run: |
-        echo "## Benchmark Results: ${{ matrix.runs-on }}" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "| Benchmark | Result |" >> $GITHUB_STEP_SUMMARY
-        echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
-        while IFS='=' read -r key value; do
-          [ -n "$key" ] && echo "| **$key** | $value |" >> $GITHUB_STEP_SUMMARY
-        done < "$S"
+        : > /tmp/vals
+        for i in $(seq 20); do
+          dig +tries=1 +time=2 "run$i-$RANDOM.github.com" 2>/dev/null \
+            | awk '/Query time:/{print $4}' >> /tmp/vals || true
+        done
+        recstats network "DNS query (uncached)" "ms" < /tmp/vals
+        : > /tmp/vals
+        for i in $(seq 20); do
+          dig +tries=1 +time=2 github.com 2>/dev/null | awk '/Query time:/{print $4}' >> /tmp/vals || true
+        done
+        recstats network "DNS query (cached)" "ms" < /tmp/vals
+        cat /etc/resolv.conf
+
+    - name: "Network: latency, jitter and packet loss"
+      continue-on-error: true
+      run: |
+        for TARGET in github.com 8.8.8.8 1.1.1.1; do
+          OUT=$(ping -c 20 -i 0.2 "$TARGET" 2>&1) || { echo "ping $TARGET failed"; continue; }
+          echo "$OUT"
+          # A bare VAR=$(grep ...) that finds nothing aborts the step under
+          # `set -e`, so swallow the non-match.
+          RTT=$(echo "$OUT" | grep -oP '= \K[\d.]+/[\d.]+/[\d.]+/[\d.]+' || true)
+          LOSS=$(echo "$OUT" | grep -oP '\K[\d.]+(?=% packet loss)' || true)
+          [ -n "$RTT" ] || { echo "no rtt line for $TARGET"; continue; }
+          rec network "ping $TARGET avg"    "$(echo "$RTT" | cut -d/ -f2)" "ms"
+          rec network "ping $TARGET max"    "$(echo "$RTT" | cut -d/ -f3)" "ms"
+          rec network "ping $TARGET jitter" "$(echo "$RTT" | cut -d/ -f4)" "ms"
+          rec network "ping $TARGET loss"   "$LOSS" "%"
+        done
+        echo "--- mtr to github.com ---"
+        sudo mtr --report --report-cycles 30 github.com 2>/dev/null || echo "mtr unavailable"
+
+    - name: "Network: parallel connections (PPS / conntrack limits)"
+      continue-on-error: true
+      run: |
+        CT_MAX=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo "n/a")
+        rec network "nf_conntrack_max" "$CT_MAX"
+        START=$(date +%s.%N)
+        seq 200 | xargs -P 200 -I{} curl -s -o /dev/null --max-time 30 https://www.google.com/generate_204 || true
+        END=$(date +%s.%N)
+        rec network "200 parallel HTTPS requests" \
+          "$(awk -v a="$START" -v b="$END" 'BEGIN{printf "%.2f", b-a}')" "s"
+        rec network "conntrack entries in use" "$(sudo conntrack -C 2>/dev/null || echo n/a)"
+
+    - name: "Network: iperf3 (public server, best effort)"
+      continue-on-error: true
+      run: |
+        # NOTE: a runner-to-runner iperf3 is the number you really want, but it
+        # needs a rendezvous point between two matrix jobs. Public servers are
+        # a rough proxy and are frequently busy.
+        for SRV in speedtest.uztelecom.uz bouygues.iperf.fr.prod.hosts.ooklaserver.net paris.testdebit.info; do
+          if OUT=$(iperf3 -c "$SRV" -t 10 -P 4 --connect-timeout 5000 2>&1); then
+            echo "$OUT"
+            BPS=$(echo "$OUT" | awk '/receiver/{print $(NF-2), $(NF-1)}' | tail -1)
+            rec network "iperf3 ($SRV)" "$(echo "$BPS" | awk '{print $1}')" "$(echo "$BPS" | awk '{print $2}')"
+            break
+          fi
+          echo "iperf3: $SRV unavailable"
+        done
+
+    # ── 10. GitHub Actions storage throughput ────────────────────
+    # Cache and artifact I/O sits outside the VM but dominates a lot of real
+    # pipelines, so it belongs in a runner comparison.
+    - name: "Storage: generate 256 MiB payload"
+      continue-on-error: true
+      if: env.HEAVY == 'true'
+      run: |
+        mkdir -p /tmp/payload
+        head -c 268435456 /dev/urandom > /tmp/payload/blob.bin
+        echo "T_UP_START=$(date +%s.%N)" >> "$GITHUB_ENV"
+
+    - name: "Storage: upload artifact"
+      continue-on-error: true
+      if: env.HEAVY == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: payload-${{ matrix.runs-on }}-${{ matrix.index }}
+        path: /tmp/payload/blob.bin
+        retention-days: 1
+        compression-level: 0
+
+    - name: "Storage: mark upload end"
+      continue-on-error: true
+      if: env.HEAVY == 'true'
+      run: |
+        echo "T_UP_END=$(date +%s.%N)" >> "$GITHUB_ENV"
+        rm -rf /tmp/payload
+        echo "T_DL_START=$(date +%s.%N)" >> "$GITHUB_ENV"
+
+    - name: "Storage: download artifact"
+      continue-on-error: true
+      if: env.HEAVY == 'true'
+      uses: actions/download-artifact@v4
+      with:
+        name: payload-${{ matrix.runs-on }}-${{ matrix.index }}
+        path: /tmp/payload-dl
+
+    - name: "Storage: record artifact throughput"
+      continue-on-error: true
+      if: env.HEAVY == 'true'
+      run: |
+        UP=$(awk -v a="$T_UP_START" -v b="$T_UP_END" 'BEGIN{printf "%.2f", b-a}')
+        DL=$(awk -v a="$T_DL_START" -v b="$(date +%s.%N)" 'BEGIN{printf "%.2f", b-a}')
+        rec network "artifact upload 256MiB"   "$UP" "s"
+        rec network "artifact download 256MiB" "$DL" "s"
+        rec network "artifact upload rate"     "$(awk -v t="$UP" 'BEGIN{printf "%.1f", (t>0)?256/t:0}')" "MiB/s"
+        rec network "artifact download rate"   "$(awk -v t="$DL" 'BEGIN{printf "%.1f", (t>0)?256/t:0}')" "MiB/s"
+        rm -rf /tmp/payload-dl
+
+    # ── 10b. GitHub Actions cache throughput ─────────────────────
+    # Two shapes, because they stress different things:
+    #   (a) one large incompressible blob -> raw transfer rate to the cache
+    #       backend, with zstd unable to hide anything;
+    #   (b) a node_modules-shaped tree -> what a real cache step actually pays,
+    #       which is tar + zstd over tens of thousands of tiny files.
+    # Each phase is bracketed by marker steps, so the numbers include the
+    # action's own startup — that is part of what a cache step costs in practice.
+    - name: "Cache: generate payloads"
+      continue-on-error: true
+      if: env.HEAVY == 'true'
+      run: |
+        mkdir -p /tmp/cache-big
+        head -c "$(( CACHE_SIZE_MB * 1048576 ))" /dev/urandom > /tmp/cache-big/blob.bin
+        sha256sum /tmp/cache-big/blob.bin > /tmp/cache-big.sha256
+
+        mkdir -p /tmp/cache-small
+        python3 - <<'PY'
+        import os, random
+        random.seed(1)
+        for i in range(400):
+            d = f"/tmp/cache-small/pkg{i:03d}/lib"
+            os.makedirs(d, exist_ok=True)
+            for j in range(100):
+                with open(f"{d}/m{j:03d}.js", "w") as f:
+                    f.write("// " + "x" * random.randint(200, 16000) + "\n")
+        PY
+        SMALL_FILES=$(find /tmp/cache-small -type f | wc -l)
+        SMALL_MB=$(du -sm /tmp/cache-small | cut -f1)
+        echo "SMALL_MB=$SMALL_MB" >> "$GITHUB_ENV"
+        rec network "cache small-tree files" "$SMALL_FILES" "files"
+        rec network "cache small-tree size"  "$SMALL_MB"    "MiB"
+        echo "big=${CACHE_SIZE_MB}MiB  small=${SMALL_MB}MiB in ${SMALL_FILES} files"
+        echo "T_CBS=$(date +%s.%N)" >> "$GITHUB_ENV"
+
+    - name: "Cache: save large blob"
+      continue-on-error: true
+      if: env.HEAVY == 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: /tmp/cache-big
+        key: bench-big-${{ github.run_id }}-${{ matrix.runs-on }}-${{ matrix.index }}
+
+    - name: "Cache: mark blob save end / tree save start"
+      continue-on-error: true
+      if: env.HEAVY == 'true'
+      run: |
+        echo "T_CBS_END=$(date +%s.%N)" >> "$GITHUB_ENV"
+        echo "T_CSS=$(date +%s.%N)" >> "$GITHUB_ENV"
+
+    - name: "Cache: save small-file tree"
+      continue-on-error: true
+      if: env.HEAVY == 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: /tmp/cache-small
+        key: bench-small-${{ github.run_id }}-${{ matrix.runs-on }}-${{ matrix.index }}
+
+    - name: "Cache: mark tree save end, drop local copies"
+      continue-on-error: true
+      if: env.HEAVY == 'true'
+      run: |
+        echo "T_CSS_END=$(date +%s.%N)" >> "$GITHUB_ENV"
+        # Restore has to actually write the data back, so remove the originals.
+        rm -rf /tmp/cache-big /tmp/cache-small
+        sync
+        echo "T_CBR=$(date +%s.%N)" >> "$GITHUB_ENV"
+
+    - name: "Cache: restore large blob"
+      id: restore-big
+      continue-on-error: true
+      if: env.HEAVY == 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: /tmp/cache-big
+        key: bench-big-${{ github.run_id }}-${{ matrix.runs-on }}-${{ matrix.index }}
+
+    - name: "Cache: mark blob restore end / tree restore start"
+      continue-on-error: true
+      if: env.HEAVY == 'true'
+      run: |
+        echo "T_CBR_END=$(date +%s.%N)" >> "$GITHUB_ENV"
+        echo "T_CSR=$(date +%s.%N)" >> "$GITHUB_ENV"
+
+    - name: "Cache: restore small-file tree"
+      id: restore-small
+      continue-on-error: true
+      if: env.HEAVY == 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: /tmp/cache-small
+        key: bench-small-${{ github.run_id }}-${{ matrix.runs-on }}-${{ matrix.index }}
+
+    - name: "Cache: verify and record"
+      continue-on-error: true
+      if: env.HEAVY == 'true'
+      env:
+        HIT_BIG: ${{ steps.restore-big.outputs.cache-hit }}
+        HIT_SMALL: ${{ steps.restore-small.outputs.cache-hit }}
+      run: |
+        T_CSR_END=$(date +%s.%N)
+        el() { awk -v a="$1" -v b="$2" 'BEGIN{printf "%.2f", b-a}'; }
+        rate() { awk -v m="$1" -v t="$2" 'BEGIN{printf "%.1f", (t>0)?m/t:0}'; }
+
+        rec network "cache hit (blob)" "${HIT_BIG:-false}"
+        rec network "cache hit (tree)" "${HIT_SMALL:-false}"
+
+        # A miss means the cache never came back, so the restore timing below
+        # would be measuring nothing. Say so rather than recording a fast lie.
+        if [ "$HIT_BIG" != "true" ] || [ "$HIT_SMALL" != "true" ]; then
+          echo "::warning::cache restore missed (blob=$HIT_BIG tree=$HIT_SMALL) - restore timings are not meaningful"
+        fi
+
+        BSAVE=$(el "$T_CBS" "$T_CBS_END"); BREST=$(el "$T_CBR" "$T_CBR_END")
+        SSAVE=$(el "$T_CSS" "$T_CSS_END"); SREST=$(el "$T_CSR" "$T_CSR_END")
+
+        rec network "cache save ${CACHE_SIZE_MB}MiB blob"    "$BSAVE" "s"
+        rec network "cache restore ${CACHE_SIZE_MB}MiB blob" "$BREST" "s"
+        rec network "cache save rate (blob)"                 "$(rate "$CACHE_SIZE_MB" "$BSAVE")" "MiB/s"
+        rec network "cache restore rate (blob)"              "$(rate "$CACHE_SIZE_MB" "$BREST")" "MiB/s"
+
+        rec network "cache save small tree"    "$SSAVE" "s"
+        rec network "cache restore small tree" "$SREST" "s"
+        rec network "cache save rate (tree)"    "$(rate "${SMALL_MB:-0}" "$SSAVE")" "MiB/s"
+        rec network "cache restore rate (tree)" "$(rate "${SMALL_MB:-0}" "$SREST")" "MiB/s"
+
+        echo "--- integrity ---"
+        if sha256sum -c /tmp/cache-big.sha256; then
+          rec network "cache blob checksum" "ok"
+        else
+          rec network "cache blob checksum" "MISMATCH"
+          echo "::warning::restored cache blob does not match the saved checksum"
+        fi
+        RESTORED=$(find /tmp/cache-small -type f 2>/dev/null | wc -l)
+        rec network "cache tree files restored" "$RESTORED" "files"
+        echo "restored $RESTORED files from the small tree"
+        rm -rf /tmp/cache-big /tmp/cache-small /tmp/cache-big.sha256
+
+    - name: "Cache: delete benchmark entries"
+      if: always()
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        # These are throwaway multi-GB entries; leaving them would eat the
+        # repository's 10 GB cache budget and evict real caches.
+        for K in "bench-big-${{ github.run_id }}-${{ matrix.runs-on }}-${{ matrix.index }}" \
+                 "bench-small-${{ github.run_id }}-${{ matrix.runs-on }}-${{ matrix.index }}"; do
+          gh cache delete "$K" --repo "$GITHUB_REPOSITORY" 2>&1 || echo "could not delete cache key $K"
+        done
+
+    # ── 11. PostgreSQL ───────────────────────────────────────────
+    - name: "PostgreSQL: pgbench helper"
+      continue-on-error: true
+      run: |
+        sudo tee /usr/local/bin/pgb >/dev/null <<'PGB'
+        #!/usr/bin/env bash
+        # pgb <label> <extra pgbench args...>
+        set -euo pipefail
+        L=$1; shift
+        OUT=$(PGPASSWORD=postgres pgbench -h localhost -U postgres "$@" bench)
+        echo "$OUT"
+        rec postgres "$L tps"     "$(echo "$OUT" | grep -oP 'tps = \K[\d.]+' | tail -1)" "TPS"
+        rec postgres "$L lat avg" "$(echo "$OUT" | grep -oP 'latency average = \K[\d.]+' | tail -1)" "ms"
+        SD=$(echo "$OUT" | grep -oP 'latency stddev = \K[\d.]+' | tail -1 || true)
+        [ -n "$SD" ] && rec postgres "$L lat stddev" "$SD" "ms" || true
+        PGB
+        sudo chmod +x /usr/local/bin/pgb
+
+    - name: "PostgreSQL: in-cache benchmark (scale 50, CPU-bound)"
+      continue-on-error: true
+      run: |
+        # scale 50 is ~750 MB: it fits in page cache, so this measures CPU and
+        # the Docker bridge, not storage. Kept deliberately as the CPU-bound
+        # reference point.
+        START=$(date +%s)
+        PGPASSWORD=postgres pgbench -i -q -s 50 -h localhost -U postgres bench
+        rec postgres "init scale 50" "$(( $(date +%s) - START ))" "s"
+        pgb "in-cache read-only"  -S -M prepared -c 10 -j "$(nproc)" -T 60
+        pgb "in-cache read-write" -M prepared -c 10 -j "$(nproc)" -T 60
+        pgb "in-cache read-only (simple protocol)" -S -c 10 -j "$(nproc)" -T 30
+
+    - name: "PostgreSQL: disk-bound benchmark (larger than page cache)"
+      continue-on-error: true
+      run: |
+        # ~15 MB per scale unit. At the default scale of 300 the dataset is
+        # ~4.5 GB, which forces real reads on an 8 GB runner.
+        echo "scale=$PGBENCH_SCALE (~$(( PGBENCH_SCALE * 15 )) MB)"
+        START=$(date +%s)
+        PGPASSWORD=postgres pgbench -i -q -s "$PGBENCH_SCALE" -h localhost -U postgres bench
+        INIT=$(( $(date +%s) - START ))
+        rec postgres "init scale $PGBENCH_SCALE (bulk load)" "$INIT" "s"
+        rec postgres "bulk load rate" \
+          "$(awk -v s="$PGBENCH_SCALE" -v t="$INIT" 'BEGIN{printf "%.1f", (t>0)?(s*15)/t:0}')" "MB/s"
+        free -h
+        pgb "disk-bound read-only"  -S -M prepared -c 10 -j "$(nproc)" -T 60
+        pgb "disk-bound read-write" -M prepared -c 10 -j "$(nproc)" -T 60
+
+    - name: "PostgreSQL: local socket (Docker overhead delta)"
+      continue-on-error: true
+      run: |
+        # The apt-installed cluster was already being installed but never used.
+        # The gap against the service-container numbers is your Docker
+        # bridge + overlayfs overhead.
+        sudo systemctl start postgresql 2>/dev/null || sudo pg_ctlcluster 16 main start 2>/dev/null || true
+        sudo -u postgres psql -c "SELECT version();"
+        sudo -u postgres dropdb --if-exists benchlocal
+        sudo -u postgres createdb benchlocal
+        sudo -u postgres pgbench -i -q -s 50 benchlocal
+        for MODE in "-S:read-only" ":read-write"; do
+          FLAG=${MODE%%:*}; NAME=${MODE##*:}
+          OUT=$(sudo -u postgres pgbench $FLAG -M prepared -c 10 -j "$(nproc)" -T 30 benchlocal)
+          echo "$OUT"
+          rec postgres "local socket $NAME tps" "$(echo "$OUT" | grep -oP 'tps = \K[\d.]+' | tail -1)" "TPS"
+        done
+
+    # ── 12. Real CI workloads ────────────────────────────────────
+    # Synthetic scores do not predict CI wall-clock. These are the shapes users
+    # actually run: small-file I/O, single-core compile speed, registry pulls.
+    - name: "Workload: git clone (small files + network)"
+      continue-on-error: true
+      run: |
+        START=$(date +%s)
+        git clone --depth=1 --quiet https://github.com/torvalds/linux /tmp/linux
+        rec workload "git clone linux --depth=1" "$(( $(date +%s) - START ))" "s"
+        rec workload "cloned files" "$(find /tmp/linux -type f | wc -l)" "files"
+        START=$(date +%s)
+        git -C /tmp/linux status --porcelain >/dev/null
+        rec workload "git status (linux tree)" "$(( $(date +%s) - START ))" "s"
+
+    - name: "Workload: tar + untar + rm (metadata ops)"
+      continue-on-error: true
+      run: |
+        START=$(date +%s)
+        tar -C /tmp -cf /tmp/linux.tar --exclude=.git linux
+        rec workload "tar create" "$(( $(date +%s) - START ))" "s"
+        mkdir -p /tmp/untar
+        START=$(date +%s)
+        tar -C /tmp/untar -xf /tmp/linux.tar
+        sync
+        rec workload "tar extract" "$(( $(date +%s) - START ))" "s"
+        START=$(date +%s)
+        rm -rf /tmp/untar
+        sync
+        rec workload "rm -rf linux tree" "$(( $(date +%s) - START ))" "s"
+        rm -f /tmp/linux.tar
+
+    - name: "Workload: kernel subset build (compile throughput)"
+      if: env.HEAVY == 'true'
+      continue-on-error: true
+      run: |
+        cd /tmp/linux
+        make defconfig >/dev/null 2>&1
+        START=$(date +%s)
+        if make -j"$(nproc)" -s kernel/ mm/ fs/ > /tmp/kbuild.log 2>&1; then
+          rec workload "kernel build (kernel/ mm/ fs/)" "$(( $(date +%s) - START ))" "s"
+        else
+          echo "::warning::kernel build failed - not recording a time"
+          tail -40 /tmp/kbuild.log
+        fi
+
+    - name: "Workload: docker build (cold cache)"
+      if: env.HEAVY == 'true'
+      continue-on-error: true
+      run: |
+        START=$(date +%s)
+        docker build --no-cache --progress=plain -t bench:1 - <<'DOCKERFILE'
+        FROM ubuntu:24.04
+        RUN apt-get update && apt-get install -y --no-install-recommends build-essential curl git
+        RUN dd if=/dev/urandom of=/blob bs=1M count=512 && sha256sum /blob
+        DOCKERFILE
+        rec workload "docker build (cold cache)" "$(( $(date +%s) - START ))" "s"
+
+    - name: "Workload: docker pull (registry throughput)"
+      continue-on-error: true
+      run: |
+        docker rmi -f node:22 >/dev/null 2>&1 || true
+        START=$(date +%s)
+        docker pull -q node:22
+        rec workload "docker pull node:22" "$(( $(date +%s) - START ))" "s"
+        rec workload "node:22 image size" \
+          "$(docker image inspect node:22 -f '{{.Size}}' | awk '{printf "%.0f", $1/1048576}')" "MiB"
+
+    - name: "Workload: npm ci (thousands of tiny files)"
+      if: env.HEAVY == 'true'
+      continue-on-error: true
+      run: |
+        command -v npm >/dev/null || { echo "npm not available"; exit 0; }
+        git clone --depth=1 --quiet https://github.com/vuejs/core /tmp/vuecore
+        cd /tmp/vuecore
+        START=$(date +%s)
+        npm install --no-audit --no-fund >/dev/null 2>&1
+        rec workload "npm install (vuejs/core)" "$(( $(date +%s) - START ))" "s"
+        rec workload "node_modules files" "$(find node_modules -type f 2>/dev/null | wc -l)" "files"
+
+    - name: "Workload: pip install (compile + wheels)"
+      continue-on-error: true
+      run: |
+        python3 -m venv /tmp/venv
+        START=$(date +%s)
+        /tmp/venv/bin/pip install -q --no-cache-dir numpy pandas requests cryptography
+        rec workload "pip install (numpy/pandas/cryptography)" "$(( $(date +%s) - START ))" "s"
+
+    # ── 13. Steal time / PSI summary ─────────────────────────────
+    - name: "Contention: steal time and pressure summary"
+      continue-on-error: true
+      if: always()
+      run: |
+        pkill -f /tmp/sampler.sh || true
+        SAMPLES=$(wc -l < /tmp/sampler.log 2>/dev/null || echo 0)
+        echo "collected $SAMPLES samples"
+        [ "$SAMPLES" -lt 10 ] && { echo "::warning::sampler collected too few samples"; exit 0; }
+
+        # fields: 1 epoch, 2-9 user nice system idle iowait irq softirq steal,
+        #         10-12 PSI some avg10 for cpu / io / memory
+        awk '
+          NR>1 {
+            tot=0; for (i=2;i<=9;i++) { d[i]=$i-p[i]; tot+=d[i] }
+            if (tot>0) {
+              st=100*d[9]/tot; io=100*d[6]/tot; sy=100*d[4]/tot;
+              ssum+=st; if (st>smax) smax=st;
+              isum+=io; if (io>imax) imax=io;
+              sysum+=sy; n++
+            }
+          }
+          { for (i=2;i<=9;i++) p[i]=$i
+            if ($10+0>pcmax) pcmax=$10+0; pcsum+=$10
+            if ($11+0>pimax) pimax=$11+0; pisum+=$11
+            if ($12+0>pmmax) pmmax=$12+0; pmsum+=$12
+            m++ }
+          END {
+            if (!n || !m) exit
+            printf "steal_avg %.3f\nsteal_peak %.3f\niowait_avg %.3f\niowait_peak %.3f\nsys_avg %.3f\n", \
+                   ssum/n, smax, isum/n, imax, sysum/n
+            printf "psi_cpu_avg %.2f\npsi_cpu_peak %.2f\npsi_io_avg %.2f\npsi_io_peak %.2f\npsi_mem_avg %.2f\npsi_mem_peak %.2f\n", \
+                   pcsum/m, pcmax, pisum/m, pimax, pmsum/m, pmmax
+          }' /tmp/sampler.log > /tmp/contention.txt
+        cat /tmp/contention.txt
+
+        while read -r K V; do
+          case "$K" in
+            steal_avg)     rec contention "CPU steal avg"        "$V" "%" ;;
+            steal_peak)    rec contention "CPU steal peak (1s)"  "$V" "%" ;;
+            iowait_avg)    rec contention "iowait avg"           "$V" "%" ;;
+            iowait_peak)   rec contention "iowait peak (1s)"     "$V" "%" ;;
+            sys_avg)       rec contention "system time avg"      "$V" "%" ;;
+            psi_cpu_avg)   rec contention "PSI cpu some avg10 (mean)"  "$V" "%" ;;
+            psi_cpu_peak)  rec contention "PSI cpu some avg10 (peak)"  "$V" "%" ;;
+            psi_io_avg)    rec contention "PSI io some avg10 (mean)"   "$V" "%" ;;
+            psi_io_peak)   rec contention "PSI io some avg10 (peak)"   "$V" "%" ;;
+            psi_mem_avg)   rec contention "PSI mem some avg10 (mean)"  "$V" "%" ;;
+            psi_mem_peak)  rec contention "PSI mem some avg10 (peak)"  "$V" "%" ;;
+          esac
+        done < /tmp/contention.txt
+
+        echo "--- steal % by minute ---"
+        awk 'NR>1 {
+               tot=0; for (i=2;i<=9;i++) { d[i]=$i-p[i]; tot+=d[i] }
+               if (tot>0) { b=int((NR-1)/60); s[b]+=100*d[9]/tot; c[b]++ }
+             }
+             { for (i=2;i<=9;i++) p[i]=$i }
+             END { for (i=0;i<=b;i++) if (c[i]) printf "min %3d  steal %6.2f%%\n", i, s[i]/c[i] }' /tmp/sampler.log
+
+        echo "--- final PSI ---"
+        cat /proc/pressure/cpu /proc/pressure/io /proc/pressure/memory
+        echo "--- dmesg tail (throttling / OOM / device errors) ---"
+        sudo dmesg -T 2>/dev/null | tail -50 || true
+
+    # ── 14. Summary + artifacts ──────────────────────────────────
+    - name: "Write job summary"
+      continue-on-error: true
+      if: always()
+      run: |
+        [ -s "$BENCH_FILE" ] || { echo "no results"; exit 0; }
+        {
+          echo "## ${{ matrix.runs-on }} — run #${{ matrix.index }}"
+          echo
+          jq -r -s '
+            def rank: {"runner":0,"system":1,"provider":2,"setup":3,"cpu":4,"memory":5,
+                       "io":6,"network":7,"postgres":8,"workload":9,"contention":10}[.] // 99;
+            group_by(.category) | sort_by(.[0].category | rank) | .[] |
+            "### " + (.[0].category | ascii_upcase) + "\n\n" +
+            "| Metric | Value | Spread (n runs) |\n|---|---|---|\n" +
+            ( map(
+                "| " + .key
+                + " | " + ((.value|tostring) + (if (.unit // "") == "" then "" else " " + .unit end))
+                + " | " + (if (.runs // 1) > 1
+                           then ((.min|tostring) + " – " + (.max|tostring) + " (n=" + ((.runs|tostring)) + ")")
+                           else "" end)
+                + " |")
+              | join("\n") ) + "\n"
+          ' "$BENCH_FILE"
+        } >> "$GITHUB_STEP_SUMMARY"
 
     - name: "Upload benchmark results"
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: bench-${{ matrix.runs-on }}
-        path: /tmp/bench.csv
+        name: bench-${{ matrix.runs-on }}-${{ matrix.index }}
+        path: |
+          /tmp/bench.jsonl
+          /tmp/sampler.log
+          /tmp/contention.txt
+          /tmp/fio-json/
+          /tmp/eps.log
+        if-no-files-found: warn
 
-  # ── Compare all runners ──────────────────────────────────────
+  # ── Compare all runners ────────────────────────────────────────
   compare:
     name: "Compare Results"
     needs: build
@@ -408,45 +1233,92 @@ jobs:
 
     - name: "Build comparison table"
       run: |
-        ruby -e '
-          require "pathname"
+        cat > /tmp/compare.rb <<'RUBY'
+        require "json"
+        require "pathname"
+        require "set"
 
-          dir = Pathname("/tmp/results")
-          runners = dir.glob("bench-*").select(&:directory?).map { |d| d.basename.to_s.delete_prefix("bench-") }.sort
+        DIR = Pathname("/tmp/results")
 
-          # Parse all CSV files: { runner => [[key, value], ...] }
-          data = {}
-          runners.each do |runner|
-            file = dir / "bench-#{runner}" / "bench.csv"
-            next unless file.exist?
-            data[runner] = file.readlines.filter_map { |line|
-              key, value = line.strip.split("=", 2)
-              [key, value] if key && !key.empty?
-            }
+        def num(v)
+          return v.to_s unless v.is_a?(Numeric)
+          a = v.abs
+          return format("%d", v.round) if a >= 1000
+          return format("%.4g", v)     if a < 1
+          format("%.2f", v).sub(/\.?0+\z/, "")
+        end
+
+        def cell(r)
+          return "—" if r.nil?
+          return "**FAILED**" if r["runs"].to_i.zero?
+          s = num(r["value"])
+          u = r["unit"].to_s
+          s = "#{s} #{u}" unless u.empty?
+          if r["runs"].to_i > 1 && r["min"] && r["max"] && r["value"].is_a?(Numeric)
+            base = r["value"].to_f
+            pct  = base.zero? ? nil : ((r["max"].to_f - r["min"].to_f).abs / base * 100).round
+            span = "#{num(r["min"])}–#{num(r["max"])}"
+            span += " ±#{pct}%" if pct
+            s += "<br><sub>#{span}</sub>"
           end
+          s
+        end
 
-          # Ordered unique keys (preserving first-seen order)
-          keys = data.values.flat_map { |rows| rows.map(&:first) }.uniq
+        cols, data, order, seen = [], {}, [], Set.new
 
-          # Build lookup: { [runner, key] => value }
-          lookup = {}
-          data.each do |runner, rows|
-            rows.each { |key, value| lookup[[runner, key]] = value }
+        DIR.glob("bench-*").select(&:directory?).sort_by { |d| d.basename.to_s }.each do |d|
+          file = d / "bench.jsonl"
+          next unless file.exist?
+          name = d.basename.to_s.delete_prefix("bench-")
+          rows = {}
+          file.each_line do |line|
+            line = line.strip
+            next if line.empty?
+            r = begin JSON.parse(line) rescue nil end
+            next unless r && r["key"]
+            k = [r["category"].to_s, r["key"].to_s]
+            (order << k; seen << k) unless seen.include?(k)
+            rows[k] = r
           end
+          next if rows.empty?
+          cols << name
+          data[name] = rows
+        end
 
-          # Filter to runners that have data
-          runners = runners.select { |r| data.key?(r) }
-
-          # Output markdown table
-          summary = ENV["GITHUB_STEP_SUMMARY"]
-          File.open(summary, "a") do |f|
-            f.puts "## Runner Comparison"
-            f.puts ""
-            f.puts "| Benchmark | #{runners.join(" | ")} |"
-            f.puts "|-----------|#{runners.map { "--------" }.join("|")}|"
-            keys.each do |key|
-              values = runners.map { |r| lookup[[r, key]] || "N/A" }
-              f.puts "| **#{key}** | #{values.join(" | ")} |"
+        out = +""
+        if cols.empty?
+          out << "## Runner Comparison\n\nNo benchmark results were produced.\n"
+        else
+          out << "## Runner Comparison\n\n"
+          out << "Values are the **median** of n runs; the small line underneath is the min–max spread.\n\n"
+          order.group_by(&:first).each do |category, keys|
+            out << "### #{category.upcase}\n\n"
+            out << "| Metric | #{cols.join(' | ')} |\n"
+            out << "|---|#{cols.map { '---' }.join('|')}|\n"
+            keys.each do |k|
+              out << "| **#{k[1]}** | #{cols.map { |c| cell(data[c][k]) }.join(' | ')} |\n"
             end
+            out << "\n"
           end
-        '
+        end
+
+        File.write(ENV.fetch("GITHUB_STEP_SUMMARY"), out, mode: "a")
+        print out
+
+        # Machine-readable roll-up for trend tracking across runs.
+        File.write("/tmp/all-results.json", JSON.pretty_generate(
+          run_id:   ENV["GITHUB_RUN_ID"],
+          sha:      ENV["GITHUB_SHA"],
+          recorded: Time.now.utc.iso8601,
+          runners:  data.transform_values { |rows| rows.values }
+        ))
+        RUBY
+        ruby -rtime /tmp/compare.rb
+
+    - name: "Upload merged results"
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: all-results
+        path: /tmp/all-results.json
+        if-no-files-found: warn
