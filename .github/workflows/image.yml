@@ -35,7 +35,7 @@ jobs:
         - ubicloud-premium-${{ github.event.inputs.vcpus || '2' }}-ubuntu-2404
         # Add more indices (e.g. [1, 2, 3]) to sample across VM placements --
         # with a single index you cannot tell a slow runner from an unlucky one.
-        index: [1]
+        index: [1,2,3,4]
     name: "${{matrix.runs-on}} (#${{matrix.index}})"
     runs-on: ${{matrix.runs-on}}
     continue-on-error: true
