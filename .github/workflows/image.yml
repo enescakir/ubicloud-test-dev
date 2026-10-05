@@ -20,6 +20,20 @@ jobs:
           - ubicloud-standard-2-ubuntu-2404
           - ubicloud-standard-2-ubuntu-2404
           - ubicloud-standard-2-ubuntu-2404
+          - ubicloud-standard-2-ubuntu-2404
+          - ubicloud-standard-2-ubuntu-2404
+          - ubicloud-standard-2-ubuntu-2404
+          - ubicloud-standard-2-ubuntu-2404
+          - ubicloud-standard-2-ubuntu-2404
+          - ubicloud-standard-4-ubuntu-2404
+          - ubicloud-standard-4-ubuntu-2404
+          - ubicloud-standard-4-ubuntu-2404
+          # - ubicloud-standard-2-ubuntu-2404
+          # - ubicloud-standard-2-ubuntu-2404
+          # - ubicloud-standard-2-ubuntu-2404
+          # - ubicloud-standard-2-ubuntu-2404
+          # - ubicloud-standard-2-ubuntu-2404
+          # - ubicloud-standard-2-ubuntu-2404
           # - ubicloud-standard-4-arm-ubuntu-2404
           # - ubicloud-standard-4-arm-ubuntu-2604
           # - ubicloud-standard-4-arm-ubuntu-2604
