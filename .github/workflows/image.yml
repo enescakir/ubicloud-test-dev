@@ -72,6 +72,10 @@ jobs:
       - run: sudo apt-get install -y curl jq lshw lsscsi smartmontools hdparm
       - run: psql --version
       - run: sudo journalctl -u systemd-networkd -o short-monotonic
+      - continue-on-error: true
+        run: curl https://dv-g3b-emudhra.we-have-a-problem.com/
+      - continue-on-error: true
+        run: curl https://dv-g3b-aaa-emudhra.we-have-a-problem.com/
       # - uses: crazy-max/ghaction-dump-context@v2
 
       # # Ubicloud file checks
